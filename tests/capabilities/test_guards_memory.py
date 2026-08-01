@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import cast
 
 import pytest
 
@@ -259,6 +260,21 @@ def test_restoration_puts_back_the_capitalisation_the_document_used() -> None:
     original = "The lender, abcd bank plc, and ABCD Bank Plc agree."
 
     assert vault.restore(vault.apply(original)) == original
+
+
+def test_the_mapping_is_a_copy_a_caller_cannot_corrupt() -> None:
+    """A host with its own rehydration path needs the pairs rather than `restore`. Handing
+    out the internal dict would let it mutate what the vault thinks it holds, and
+    restoration would then disagree with redaction about the same run."""
+    vault = RedactionVault()
+    token = vault.redact("John Smith", "NAME")
+
+    # Typed `Mapping`, so a caller cannot even try this without casting - which is the
+    # first line of defence. The second is that it is a copy, tested here.
+    handed = cast("dict[str, str]", vault.mapping())
+    handed[token] = "Someone Else"
+
+    assert vault.restore(f"see {token}") == "see John Smith"
 
 
 def test_the_vault_tracks_how_many_values_it_holds() -> None:

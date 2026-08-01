@@ -30,7 +30,7 @@ from attest.kernel.warrants import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from attest.kernel.evidence import Evidence
     from attest.kernel.identifiers import EvidenceId, TenantId
@@ -395,6 +395,21 @@ class RedactionVault:
             )
             found |= {m.group(0) for m in bare.finditer(text)}
         return sorted(found)
+
+    def mapping(self) -> Mapping[str, str]:
+        """A copy of token -> value, for a caller that must hand the pair off in-process.
+
+        A copy, and a method rather than a live attribute, because the guarantee at the top
+        of this class is about where this mapping may GO: never the audit chain, never
+        storage, never an outbound payload. Handing out the internal dict would let a caller
+        mutate the vault's idea of what it holds, and restoration would then disagree with
+        redaction about the same run.
+
+        A host that already owns a rehydration path - one that tolerates a model mangling
+        the delimiters, say - needs the pairs rather than :meth:`restore`. That is a real
+        case and it is better served explicitly than by reaching for ``_by_token``.
+        """
+        return dict(self._by_token)
 
     def __len__(self) -> int:
         return len(self._by_token)
