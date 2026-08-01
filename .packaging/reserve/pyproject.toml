@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "attest-control-plane"
+version = "0.0.1"
+description = "Name reserved — not yet released. See the GitHub repository."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Oluwatosin Amokeodo", email = "oluwatosin.amokeodo@gmail.com" }]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/Threx-code/attest"
+Repository = "https://github.com/Threx-code/attest.git"
+
+# Deliberately ships no package. A reservation that installed an importable `attest`
+# would shadow the real one for anyone who pinned the git URL alongside it.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.sdist]
+include = ["README.md", "pyproject.toml"]

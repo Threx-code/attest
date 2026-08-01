@@ -1,0 +1,112 @@
+site_name: Attest
+site_description: A governed control plane for AI actions — verifiable warrants, bound authorization, provenance-sealed attestations.
+repo_url: https://github.com/Threx-code/attest
+repo_name: Threx-code/attest
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+
+# Fail the build on a broken internal link or an orphaned page. The documentation
+# is a deliverable, not a folder of notes.
+strict: true
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Overview: README.md
+  - Foundations:
+      - Thesis: 00-thesis.md
+      - Layering: 01-layering.md
+      - Adoption: adoption.md
+  - Concepts:
+      - Warrants: concepts/warrants.md
+      - Assurance boundaries: concepts/assurance-boundaries.md
+      - Attestation: concepts/attestation.md
+      - Verdicts: concepts/verdicts.md
+      - Domain profile: concepts/domain-profile.md
+      - Conformance: concepts/conformance.md
+  - Kernel (L0):
+      - Configuration: kernel/config.md
+      - Ports: kernel/ports.md
+      - Execution context: kernel/execution-context.md
+      - Determinism: kernel/determinism.md
+      - Errors: kernel/errors.md
+      - Performance: kernel/performance.md
+      - Storage: kernel/storage.md
+      - Tenancy: kernel/tenancy.md
+      - Versioning: kernel/versioning.md
+  - Capabilities (L1):
+      - Evidence: capabilities/evidence.md
+      - Completeness: capabilities/completeness.md
+      - Judging: capabilities/judging.md
+      - Witness: capabilities/witness.md
+      - Data lineage: capabilities/lineage.md
+      - Contestability: capabilities/contestability.md
+      - Authority: capabilities/authority.md
+      - Approvals: capabilities/approvals.md
+      - Execution: capabilities/execution.md
+      - Audit: capabilities/audit.md
+      - Guards: capabilities/guards.md
+      - LLM gateway: capabilities/llm-gateway.md
+      - Tools: capabilities/tools.md
+      - Prompts: capabilities/prompts.md
+      - Memory: capabilities/memory.md
+  - Runtime (L2):
+      - Agents: runtime/agents.md
+      - Composition: runtime/composition.md
+      - Chains: runtime/chains.md
+      - Orchestration: runtime/orchestration.md
+      - Router: runtime/router.md
+      - Streaming: runtime/streaming.md
+      - Replay: runtime/replay.md
+  - Assurance (L3):
+      - Evaluation: assurance/eval.md
+      - Red team: assurance/redteam.md
+      - Threat model: assurance/threat-model.md
+      - Testing: assurance/testing.md
+      - Observability: assurance/observability.md
+      - Export: assurance/export.md
+  - Domains:
+      - Overview: domains/README.md
+      - Catalog: domains/catalog.md
+      - Regulatory: domains/regulatory.md
+      - Insurance: domains/insurance.md
+      - Medical: domains/medical.md
+      - Banking: domains/banking.md
+      - Mortgage: domains/mortgage.md
+      - Reporting: domains/reporting.md
+  - Adapters (L4):
+      - Django: adapters/django.md
+  - Decisions:
+      - ADR index: decisions/README.md

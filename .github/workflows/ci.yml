@@ -1,0 +1,391 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  PYTHONHASHSEED: "0"
+  FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ── Static quality ─────────────────────────────────────────────────────────
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --group lint
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: ruff check
+        run: ruff check --output-format=github .
+      # ADR 0042: behaviour lives on classes. Checked because it decayed once.
+      - name: Class-based design
+        run: python scripts/check_class_design.py
+      - name: Reachability of security controls
+        # A control implemented, unit-tested, and called by nothing passes every other
+        # gate in this pipeline. Fifteen of them did.
+        run: python scripts/check_reachability.py
+
+  typecheck:
+    name: Type check (mypy strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e . --group typecheck --group test
+      - run: mypy
+
+  architecture:
+    name: Layer contracts (import-linter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e . --group arch
+      # Enforces docs/01-layering.md: imports point downward only, and the
+      # kernel stays pure. A violation fails the build, not a code review.
+      - run: lint-imports --verbose
+
+  # ── Tests ──────────────────────────────────────────────────────────────────
+  test:
+    name: Test ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          # Cross-platform coverage on one version: path handling, file locking,
+          # and clock/monotonic behaviour differ where it matters for the audit log.
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e . --group test
+      - name: Unit, integration & contract tests
+        run: pytest -m "not concurrency and not slow" --cov=attest --cov-report= -n auto
+      - name: Concurrency & failure-injection tests
+        # Deliberately NOT parallelised: these tests own their own scheduling.
+        # These tests exist and pass — grant redemption races, budget reservation
+        # races, and crash-between-submit-and-commit. Exit 5 ("no tests collected") is
+        # still tolerated so a marker rename cannot silently red the pipeline, but it
+        # now means the selection broke rather than that the coverage was never there.
+        # `shell: bash` because this matrix includes windows-latest, where the default
+        # shell is PowerShell and `if [ "$rc" -eq 5 ]` is a parse error rather than a
+        # test failure — the job died before running anything, on every Windows run.
+        shell: bash
+        run: |
+          set +e
+          pytest -m "concurrency or failure_injection" --cov=attest --cov-append --cov-report=
+          rc=$?
+          set -e
+          if [ "$rc" -eq 5 ]; then
+            echo "::warning title=Concurrency selection is empty::The marker selection \
+          collected nothing. These tests exist, so this means the markers moved."
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+      - name: Coverage report
+        shell: bash
+        run: |
+          coverage combine || true
+          coverage report
+          coverage xml
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ── The guarantees that are not application promises ───────────────────────
+  database-guarantees:
+    name: Trigger enforcement (${{ matrix.db }})
+    runs-on: ubuntu-latest
+    # The append-only audit chain and immutable attestations are enforced by triggers,
+    # not by application code — docs/adapters/django.md says so in as many words,
+    # because "we only ever INSERT" is a convention and conventions decay.
+    #
+    # triggers.py ships three implementations. Until this job existed, exactly one of
+    # them had ever executed. PostgreSQL and MySQL were covered by a test asserting the
+    # generated SQL *contains* the words "BEFORE UPDATE" — the artefact, not the
+    # control — and a production adopter runs PostgreSQL. The one guarantee that is
+    # supposed to be structural was, for them, a string in a migration file.
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [postgres, mysql]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: attest
+          POSTGRES_USER: attest
+          POSTGRES_PASSWORD: attest
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U attest"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: attest
+          MYSQL_USER: attest
+          MYSQL_PASSWORD: attest
+          MYSQL_ROOT_PASSWORD: attest
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pattest"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[django,postgres]" --group test
+      - name: Install the MySQL driver
+        if: matrix.db == 'mysql'
+        run: pip install "mysqlclient>=2.2"
+      # MySQL needs SUPER or log_bin_trust_function_creators to create triggers as a
+      # non-root user. Granting it here rather than running the suite as root, so the
+      # job exercises the privileges a real deployment would grant its migration user.
+      - name: Allow the test user to create triggers
+        if: matrix.db == 'mysql'
+        run: |
+          mysql -h 127.0.0.1 -uroot -pattest -e \
+            "SET GLOBAL log_bin_trust_function_creators = 1; \
+             GRANT ALL PRIVILEGES ON *.* TO 'attest'@'%'; FLUSH PRIVILEGES;"
+      - name: Trigger enforcement, against a real ${{ matrix.db }}
+        env:
+          ATTEST_TEST_DB: ${{ matrix.db }}
+          ATTEST_TEST_DB_NAME: attest
+          ATTEST_TEST_DB_USER: attest
+          ATTEST_TEST_DB_PASSWORD: attest
+          ATTEST_TEST_DB_HOST: 127.0.0.1
+          ATTEST_TEST_DB_PORT: ${{ matrix.db == 'postgres' && '5432' || '3306' }}
+        # The whole Django adapter suite, not only test_triggers.py. The stores' atomicity
+        # claims — SELECT ... FOR UPDATE, SKIP LOCKED, the unique-constraint nonce — are
+        # as vendor-specific as the triggers and had never met a real database either.
+        run: pytest tests/adapters/django -v
+
+  security-tests:
+    name: Security & adversarial suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e . --group test
+      # These are a separate job so a red security suite is visible on its own,
+      # never buried inside a matrix cell.
+      - run: pytest -m security -v
+
+  # ── Supply chain ───────────────────────────────────────────────────────────
+  static-analysis:
+    name: Static security analysis (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --group security
+      - run: bandit -r src/attest -c pyproject.toml
+
+  dependency-audit:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # Audits the full extra surface, not just the (empty) base install.
+      # --skip-editable omits attest itself (unpublished, so unauditable); --strict is
+      # not set because its only effect would be to fail on that skip rather than on a
+      # real vulnerability. Third-party dependencies are still audited in full.
+      - run: pip install -e ".[all]" --group security
+      - run: pip-audit --desc --skip-editable
+
+  # ── Packaging ──────────────────────────────────────────────────────────────
+  build:
+    name: Build, verify & install from clean environment
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install build twine
+      - name: Build sdist and wheel
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: python -m build
+      - name: Verify metadata
+        run: twine check --strict dist/*
+      - name: Reproducible build check
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          mkdir -p /tmp/first && cp dist/*.whl /tmp/first/
+          rm -rf dist build
+          python -m build --wheel
+          for f in /tmp/first/*.whl; do
+            base=$(basename "$f")
+            if ! cmp -s "$f" "dist/$base"; then
+              echo "::error::Build is not reproducible: $base differs between runs"
+              exit 1
+            fi
+          done
+          echo "Wheel is byte-identical across builds."
+      - name: Install into a clean environment
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp  # import from outside the source tree
+          /tmp/clean/bin/python -c "import attest; print(attest.__version__)"
+      - name: Assert base install pulls only its declared dependencies
+        shell: bash
+        run: |
+          # docs/01-layering.md: installing `attest` alone must never pull a provider
+          # SDK, a database driver, or a web framework.
+          #
+          # The allow-list is asn1crypto and cryptography — declared in pyproject.toml
+          # as REQUIRED, not extras, because verification a deployment has to opt into
+          # is a control that is off by default — plus cffi and pycparser, which
+          # cryptography pulls in. Four wheels, and the layering property that matters
+          # is unchanged: the kernel imports nothing, and these are reached only from an
+          # L4 adapter.
+          #
+          # This list is duplicated in the Makefile's `install-check`. It drifted: the
+          # Makefile was updated when the dependencies became required and this copy was
+          # not, so the build went red on a change that had already been made
+          # deliberately. If you change one, change the other.
+          extra=$(/tmp/clean/bin/pip list --format=freeze \
+                  | grep -viE '^(pip|setuptools|wheel|attest-control-plane|asn1crypto|cryptography|cffi|pycparser)=' || true)
+          if [ -n "$extra" ]; then
+            echo "::error::Base install pulled unexpected dependencies:"
+            echo "$extra"
+            exit 1
+          fi
+          echo "Base install pulls only asn1crypto and cryptography, as declared."
+      - name: Assert an adopter can inherit the conformance kit
+        shell: bash
+        run: |
+          # The documented adoption path is `class TestMyRunStore(RunStoreConformance)`,
+          # and `attest.assurance.conformance` imports pytest at module scope — so a base
+          # install cannot import it. That is correct (a service that only runs governed
+          # decisions has no use for a test framework) and it must be *declared*, or the
+          # adopter meets ModuleNotFoundError at the moment they try to prove their
+          # adapter conforms.
+          #
+          # Both directions are asserted: the extra must be required, and it must work.
+          python -m venv /tmp/adopter
+          /tmp/adopter/bin/pip install --quiet dist/*.whl
+          cd /tmp
+          if /tmp/adopter/bin/python -c "import attest.assurance.conformance" 2>/dev/null; then
+            echo "::error::the base install pulled a test framework"; exit 1
+          fi
+          /tmp/adopter/bin/pip install --quiet "$(ls "$OLDPWD"/dist/*.whl)[conformance]"
+          /tmp/adopter/bin/python -c "
+          from attest.assurance.conformance import RunStoreConformance
+          from attest.assurance.builders import Build
+          from attest.assurance.redteam import RedTeamSuite
+          assert RedTeamSuite.all_cases()
+          print('an adopter can inherit the kit and run the corpus.')
+          "
+      - name: Record artifact digest
+        id: digest
+        run: echo "sha256=$(sha256sum dist/*.whl | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  docs:
+    name: Documentation builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --group docs
+      # The doc set must not contradict itself about what has been decided,
+      # which replay vocabulary is current, or which verdicts are reachable.
+      - name: Documentation consistency
+        run: python scripts/check_docs_consistency.py
+      - run: mkdocs build --strict
+
+  # ── Aggregate gate ─────────────────────────────────────────────────────────
+  ci:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - typecheck
+      - architecture
+      - test
+      # The trigger jobs gate the pipeline like everything else. A database job that
+      # can go red without blocking a release is a job that reports on the guarantee
+      # rather than enforcing it — which is the defect class this whole audit is about.
+      - database-guarantees
+      - security-tests
+      - static-analysis
+      - dependency-audit
+      - build
+      - docs
+    if: always()
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          if echo "$results" | grep -qE '"result": *"(failure|cancelled|skipped)"'; then
+            echo "::error::One or more required checks did not succeed."
+            exit 1
+          fi
+          echo "All required checks passed."

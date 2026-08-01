@@ -1,0 +1,540 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project metadata
+# ─────────────────────────────────────────────────────────────────────────────
+[project]
+name = "attest-control-plane"
+dynamic = ["version"]
+description = "A governed control plane for AI actions: verifiable warrants, bound authorization, and provenance-sealed attestations."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Oluwatosin Amokeodo", email = "oluwatosin.amokeodo@gmail.com" }]
+keywords = [
+    "ai-governance",
+    "agents",
+    "audit",
+    "attestation",
+    "provenance",
+    "compliance",
+    "regulated",
+    "control-plane",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Legal Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# The base install pulls NOTHING. See docs/01-layering.md: installing `attest`
+# alone must never pull a provider SDK, a database driver, or a web framework.
+dependencies = [
+    # Required, not an extra, and the reason is the whole argument of this package.
+    #
+    # Verification that a deployment has to opt into is a control that is off by
+    # default, which is precisely the defect class the security audit found fifteen
+    # times over: a collaborator accepted, stored, and never invoked. An RFC 3161 token
+    # nobody checks is a token that proves nothing, and the failure mode is a deployment
+    # that believes it is witnessed.
+    #
+    # The cost is honest and small: two wheels on `pip install attest-control-plane`.
+    # The layering property that actually matters is unchanged — the kernel still
+    # imports nothing, and these are reached only from an L4 adapter.
+    "asn1crypto>=1.5.1,<2",  # ASN.1 / CMS / RFC 3161 structures. Pure Python, no build.
+    # Floors are current, not "the oldest that compiles". Two reasons, and the first is
+    # not style: wheels before 48.0.1 bundle a vulnerable OpenSSL
+    # (GHSA-537c-gmf6-5ccf) and pip-audit fails the build on them — the gate working, on
+    # the dependency this package's own signatures rest on. The second is that a wide
+    # floor is a range nobody tests: resolution would pick a version this suite has
+    # never run against, on the code path that verifies evidence.
+    "cryptography>=50,<51",  # X.509, signature verification, certificate chains.
+]
+
+[project.optional-dependencies]
+# Runtime extras — the surface declared in docs/01-layering.md, plus the
+# providers named in docs/capabilities/llm-gateway.md and the queue wrappers in
+# docs/adapters/django.md. Installing `attest` alone must never pull any of them.
+evidence = []
+tools = []
+memory = []
+
+# The conformance kit is a pytest suite by construction: its checks *are* test methods,
+# and a host adopts them by inheriting the class into their own suite. So
+# `attest.assurance.conformance` imports pytest at module scope, and an adopter following
+# the documented path — `class TestMyRunStore(RunStoreConformance)` — gets
+# ModuleNotFoundError without it.
+#
+# An extra rather than a base dependency: `docs/01-layering.md` says installing `attest`
+# alone must never pull a test framework, and a service that only *runs* governed
+# decisions has no use for it. An extra rather than nothing, because the alternative was
+# an undeclared import that an adopter discovers at the moment they try to prove their
+# adapter conforms.
+conformance = ["pytest>=8.2"]
+
+# Providers. The gateway is the only call site; these are its backends.
+#
+# Each carries a major-version ceiling. The backends parse SDK objects through
+# `getattr` with defaults, so a major release does not fail loudly — it degrades into
+# missing token counts and unrecognised stop reasons, which is the worst way for a
+# cost record to be wrong. Cheap insurance; raise them deliberately.
+anthropic = ["anthropic>=0.120,<1"]
+openai = ["openai>=2.52,<3"]
+bedrock = ["boto3>=1.43,<2"]
+# Azure OpenAI is a parameter on OpenAIProvider, not a second implementation: same
+# SDK, same wire shape. What genuinely differs is residency, and residency is already
+# a field on ProviderSpec. The extra exists so `[azure]` installs something sensible.
+azure = ["openai>=2.52,<3"]
+# Vertex serves both families this package supports there, so the extra installs
+# both clients: anthropic's Vertex client for Claude, google-genai for Gemini.
+vertex = ["anthropic[vertex]>=0.120,<1", "google-genai>=2.16,<3"]
+# Gemini on the Developer API, without the Vertex half.
+gemini = ["google-genai>=2.16,<3"]
+groq = ["groq>=1.6,<2"]
+
+# Groq serves open-weight families (Llama, Qwen, Gemma), which widens the
+# cross-family judge pool rather than merely adding an endpoint. See ADR 0041.
+
+# Floors track the current release, ceilings stop the next major.
+#
+# A wide floor is not generosity, it is a range nobody tests: resolution picks a version
+# this suite has never run against. And the ceiling is only safe because the backends
+# stopped defaulting missing fields away — a renamed `input_tokens` used to produce a
+# zero-token, zero-cost record in a sealed attestation, so the bound was carrying weight
+# that belonged in the parsing.
+#
+# Hosts and infrastructure. Ceilings for the same reason as the provider SDKs: an
+# unbounded major means a release upstream breaks this package on a fresh install of a
+# pinned version, and the first person to find out is whoever deployed that morning.
+# The adapters read Django and DRF internals (migration operations, serializer field
+# machinery), so a major there is a real risk rather than a theoretical one.
+django = ["Django>=5.2,<7", "djangorestframework>=3.17,<4"]
+celery = ["celery>=5.6,<6"]
+fastapi = ["fastapi>=0.141,<1"]
+postgres = ["psycopg[binary]>=3.3,<4"]
+redis = ["redis>=8.1,<9"]
+
+all = [
+    "attest-control-plane[anthropic,openai,bedrock,azure,vertex,gemini,groq,django,celery,fastapi,postgres,redis]",
+]
+
+[project.scripts]
+attest = "attest.cli:CommandLine.run"
+
+[project.urls]
+Homepage = "https://github.com/Threx-code/attest"
+Documentation = "https://github.com/Threx-code/attest/tree/main/docs"
+Repository = "https://github.com/Threx-code/attest.git"
+"Bug Tracker" = "https://github.com/Threx-code/attest/issues"
+Changelog = "https://github.com/Threx-code/attest/blob/main/CHANGELOG.md"
+Security = "https://github.com/Threx-code/attest/blob/main/SECURITY.md"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependency groups (PEP 735) — development only, never shipped in the wheel.
+# ─────────────────────────────────────────────────────────────────────────────
+[dependency-groups]
+test = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "pytest-xdist>=3.6",
+    "hypothesis>=6.108",
+    # The Django adapter's guarantees are database triggers, so they can only be
+    # proven against a real database. A suite that skipped them would be asserting
+    # append-only enforcement it never exercised.
+    "Django>=4.2",
+    "djangorestframework>=3.15",
+]
+lint = [
+    "ruff>=0.6",
+]
+typecheck = [
+    "mypy>=1.11",
+]
+arch = [
+    "import-linter>=2.0",
+]
+security = [
+    "bandit>=1.7.9",
+    "pip-audit>=2.7",
+]
+docs = [
+    # Pinned below 2.0 deliberately. The MkDocs 2.0 rewrite removes the plugin
+    # system with no migration path, and ships currently unlicensed. A docs
+    # toolchain that can break unattended is not acceptable in a release gate.
+    # Revisit when 2.x has a licence and a migration story.
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5,<10",
+]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+    { include-group = "typecheck" },
+    { include-group = "arch" },
+    { include-group = "security" },
+    { include-group = "docs" },
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.hatch.version]
+path = "src/attest/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/attest"]
+# py.typed marks the package as typed so `mypy --strict` in a HOST project sees
+# our annotations rather than treating everything as Any.
+artifacts = ["src/attest/py.typed"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/attest", "tests", "docs", "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md"]
+
+# Reproducible builds: honour SOURCE_DATE_EPOCH, emit deterministic archives.
+[tool.hatch.build]
+reproducible = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ruff — lint + format
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+# Ruff formats Python code blocks embedded in Markdown. The snippets in docs/ are
+# illustrative rather than executable, and several align deliberately to make a
+# comparison legible — reformatting them destroys the thing that makes them readable.
+# The documentation has its own gates: mkdocs --strict and check_docs_consistency.py.
+exclude = ["docs", "site"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "B",           # bugbear
+    "C4",          # comprehensions
+    "UP",          # pyupgrade
+    "SIM",         # simplify
+    "TCH",         # type-checking imports
+    "ANN",         # missing annotations
+    "S",           # bandit-equivalent security rules
+    "PT",          # pytest style
+    "RET",         # return consistency
+    "SLF",         # private member access
+    "ARG",         # unused arguments
+    "PTH",         # use pathlib
+    "ERA",         # commented-out code
+    "TRY",         # exception anti-patterns
+    "RUF",
+]
+ignore = [
+    "E501",    # line length is the formatter's job
+    "TRY003",  # long messages outside exception class — we want actionable messages
+    "TRY400",  # logging.exception vs logging.error — not always right
+    "TRY301",  # "abstract raise to an inner function": inside an explicit
+               # BEGIN/ROLLBACK block the raise and the rollback belong together,
+               # and hoisting it out separates the failure from its cleanup
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may use asserts, magic values, private access, and hardcoded secrets.
+# TC (type-checking-block imports) is off here deliberately: a test fixture uses the
+# same names at runtime and in annotations, and splitting them across a TYPE_CHECKING
+# block makes the fixture harder to read for no runtime benefit.
+"tests/**" = ["S101", "S105", "S106", "SLF001", "ANN", "ARG", "PLR2004", "TC"]
+# The canonicaliser accepts arbitrary input by design — narrowing `Any` here would
+# mean the caller pre-classifies the value, which is exactly the job this module
+# does. Its type discipline is enforced at runtime instead: unsupported types raise
+# CanonicalisationError rather than being coerced.
+"src/attest/kernel/canonical.py" = ["ANN401"]
+# The codec sits on the same open boundary from the other side: evidence values, tool
+# arguments and metadata are `Any` by design, and narrowing them here would mean the
+# framework deciding what a domain may record. Fidelity is enforced instead by the
+# content-hash check on decode, which no annotation could give.
+"src/attest/kernel/codec.py" = ["ANN401"]
+# Tool arguments and JSON Schema definitions are `Any` on both sides by construction:
+# the framework does not know what a domain's tool takes, and refusing to model that is
+# the whole reason ToolSpec is a declaration rather than a base class. The executor is
+# host code the framework never calls directly — the execution boundary does — so
+# annotating it here would mean this layer importing the boundary's protocol and
+# freezing the host's signature. Discipline is enforced at runtime instead: Schema
+# refuses a keyword it cannot enforce, and ToolSpec.propose raises rather than returning
+# a partial Action.
+"src/attest/capabilities/tools.py" = ["ANN401"]
+# The builders take **overrides for whatever kernel dataclass they construct, and those
+# fields are as varied as the kernel is. Narrowing them would mean one keyword-only
+# signature per type, re-stated here and drifting from the dataclass the moment a field
+# is added — which is the failure this module exists to spare its callers. The values
+# are checked where it counts: by the dataclass, at construction, which is the whole
+# point of the module.
+"src/attest/assurance/builders.py" = ["ANN401"]
+# The eval harness takes the host's engine, binding and executor, and a golden case's
+# `build` returns the host's RunRequest. Naming those types would make L3 assurance
+# import L2 runtime, which the layering contract forbids and which would also stop a
+# host substituting its own harness — the same argument as redteam.py above.
+"src/attest/assurance/eval.py" = ["ANN401"]
+# ASN.1 is dynamically typed by construction — the DER structure decides what a field
+# holds, asn1crypto ships no py.typed, and `cryptography`'s x509 objects would have to
+# be imported at module load to be annotated, which is the deferred-import property this
+# module is built around. Narrowing here would mean asserting a shape before parsing it.
+# Discipline is enforced at runtime instead: every value is checked at the point of use
+# and a wrong one raises TimestampInvalid rather than being coerced.
+"src/attest/adapters/rfc3161.py" = ["ANN401"]
+# The red-team runner takes the host's engine, binding and executor. Naming their types
+# would make L3 assurance import L2 runtime, which the layering contract forbids and
+# which would also stop a host substituting its own harness. The suite calls exactly two
+# methods on them and a wrong object fails on the first case rather than silently.
+"src/attest/assurance/redteam.py" = ["ANN401"]
+# Protocol implementations take the full signature the interface declares, and a
+# given implementation legitimately ignores part of it — CapabilityCheck.discharge
+# needs the context and not the action. Renaming the parameter to `_action` would
+# break the protocol; using it artificially would be worse.
+"src/attest/capabilities/authority.py" = ["ARG002"]
+"src/attest/capabilities/profile.py" = ["ARG002"]
+"src/attest/capabilities/evidence.py" = ["ARG002"]
+# Port implementations take the signature the protocol declares, and some of it is not
+# needed by a given implementation. StreamSession.terminate is deliberately NOT on this
+# list any more: it used to be, with a comment saying a real implementation could log
+# the refusal it discarded — a suppression that documented a defect instead of fixing
+# it (ATT-63). A suppression here should mean "this argument genuinely has no use in
+# this implementation", never "this argument is dropped and somebody should look at it".
+"src/attest/adapters/memory.py" = ["ARG002"]
+# Provider backends sit on an untyped third-party boundary by definition: the vendor
+# SDK is imported dynamically so the base install stays dependency-free, which means
+# no static type exists to narrow to. Annotating those returns as anything other than
+# `Any` would be a claim the import cannot support. Discipline is enforced at the
+# boundary instead — every value crossing back out is coerced (`int(...)`, `str(...)`)
+# and an empty completion raises rather than being recorded as an answer.
+"src/attest/adapters/providers/*.py" = ["ANN401"]
+# The Django adapter implements framework hooks whose shape Django dictates:
+#   ANN401 — Django ships no inline types, so a hook parameter (`schema_editor`,
+#            `request`, `**options`) genuinely has no narrower type available.
+#   ARG002 — a hook takes the signature the framework calls it with. `ReadOnlyAdmin`
+#            ignores `request` because permission is unconditional, and renaming the
+#            parameter would break the override.
+#   RUF012 — `Meta.fields`, `Migration.operations` and `Migration.dependencies` are
+#            class-level mutables by framework convention; annotating them ClassVar
+#            makes Django's own machinery no safer and its migrations unreadable.
+# Scoped here only; all three remain enabled across the kernel and capability layers.
+"src/attest/adapters/django/**/*.py" = ["ANN401", "ARG002", "RUF012"]
+# The conformance kit IS a pytest suite that a domain package inherits, so its
+# assertions are the product rather than a debugging aid. `python -O` would strip
+# them, but a domain running its gate under -O has disabled its own conformance
+# suite, which the kit cannot defend against and would not want to hide.
+"src/attest/assurance/conformance.py" = ["S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["attest"]
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mypy — strict, no escape hatches in the core
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+files = ["src/attest", "tests"]
+strict = true
+warn_unreachable = true
+warn_no_return = true
+disallow_any_explicit = false
+disallow_any_generics = true
+no_implicit_reexport = true
+enable_error_code = [
+    "redundant-expr",
+    "possibly-undefined",
+    "truthy-bool",
+    "ignore-without-code",
+    "unused-awaitable",
+]
+
+# Third-party integrations are optional and untyped at the boundary.
+[[tool.mypy.overrides]]
+module = [
+    "anthropic.*",
+    "openai.*",
+    "boto3.*",
+    "groq.*",
+    "django.*",
+    "rest_framework.*",
+    "redis.*",
+    "psycopg.*",
+]
+ignore_missing_imports = true
+
+# Django ships no inline types and django-stubs is not a dependency of this package —
+# adding one would put a plugin that rewrites the type checker's model semantics into
+# the release gate of a package whose core does not import Django at all. With Django
+# resolving to `Any`, `class X(models.Model)` is subclassing Any, and every migration
+# operation hook takes an Any-typed schema editor. Those two relaxations are scoped to
+# this package only; the kernel and the capability layer remain strict.
+[[tool.mypy.overrides]]
+module = ["asn1crypto.*"]
+# asn1crypto ships no py.typed. It is a pure-Python ASN.1 parser and the values it
+# returns are dynamic by nature — the DER structure decides the type — so the wrapper
+# in adapters/rfc3161.py narrows every value at the point it is used rather than
+# pretending a stub would say something true.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["attest.adapters.django.*"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_return_any = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pytest
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+    "--tb=short",
+]
+markers = [
+    "unit: isolated component tests",
+    "integration: multi-component interaction tests",
+    "contract: port/adapter contract conformance tests",
+    "property: property-based tests",
+    "concurrency: tests exercising races and simultaneous access",
+    "failure_injection: tests that crash the system at a specific point",
+    "security: adversarial and security-boundary tests",
+    # The shipped red-team corpus, executed. `pytest -m redteam` is the command an
+    # adopter runs against their own profile before it goes to production — see
+    # docs/assurance/redteam.md. Separate from `security` because that mark covers
+    # boundary tests generally, and this one names a corpus a report can cite.
+    "redteam: the shipped adversarial corpus, run against a real engine",
+    "slow: excluded from the fast feedback loop",
+]
+filterwarnings = [
+    "error",
+    # An unraisable warning is raised during garbage collection, so pytest attributes it
+    # to whichever test happened to be running when the collector ran — which is not the
+    # test that caused it and usually not even the same file. Across four CI runs this
+    # one warning was reported against a witness test, a kernel action test, a queue
+    # test and an authority test, none of which had any connection to the leak.
+    #
+    # Failing a named test on it is therefore unsound *even when the leak is ours*: the
+    # name is noise, and chasing it costs a CI round trip each time. It is also not
+    # always ours — the last run's frames were entirely inside coverage.py's own tracer
+    # setup, and one of the two tests it failed uses in-memory stores that open no
+    # database at all.
+    #
+    # Reported rather than fatal, and replaced by something attributable: the session
+    # hook in tests/conftest.py fails the run if a connection *this package owns* is
+    # left open, and names the store. That check would have caught ATT-76 on any
+    # interpreter, where this one caught it only on 3.13 and pointed at the wrong file.
+    "default::pytest.PytestUnraisableExceptionWarning",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["attest"]
+branch = true
+parallel = true
+
+[tool.coverage.paths]
+source = ["src/attest", "*/site-packages/attest"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Deliberate threshold. Security-critical modules are held to 100% via the
+# per-module gate in scripts/check_coverage.py, not by this global floor.
+fail_under = 90
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+    "class .*\\(Protocol\\):",
+    "\\.\\.\\.",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bandit
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "build", "dist"]
+# B101 (assert_used): the only asserts in the package are the conformance kit's, and
+# there the assertions ARE the product — a domain inherits the suite and runs it as
+# pytest. Ruff's S101 is still enabled everywhere except that one file, so an assert
+# creeping into the kernel or a capability is still caught.
+skips = ["B101"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# import-linter — the L0..L4 dependency rule, machine-checked.
+# docs/01-layering.md: "A rule that is not machine-checked is a preference."
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.importlinter]
+root_packages = ["attest"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layers: imports point downward only (L0 -> L4)"
+type = "layers"
+layers = [
+    "attest.adapters",
+    "attest.assurance",
+    "attest.runtime",
+    "attest.capabilities",
+    "attest.kernel",
+]
+
+[[tool.importlinter.contracts]]
+name = "L0 kernel is pure: no third-party imports, no I/O libraries"
+type = "forbidden"
+source_modules = ["attest.kernel"]
+forbidden_modules = [
+    "django",
+    "rest_framework",
+    "fastapi",
+    "redis",
+    "psycopg",
+    "sqlite3",
+    "anthropic",
+    "openai",
+    "requests",
+    "httpx",
+    "socket",
+    "urllib",
+]
+
+[[tool.importlinter.contracts]]
+name = "L1 capabilities never reach for infrastructure directly"
+type = "forbidden"
+source_modules = ["attest.capabilities"]
+forbidden_modules = [
+    "django",
+    "rest_framework",
+    "fastapi",
+    "redis",
+    "psycopg",
+    "sqlite3",
+    "anthropic",
+    "openai",
+    "requests",
+    "httpx",
+]
