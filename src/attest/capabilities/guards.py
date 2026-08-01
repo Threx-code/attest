@@ -47,15 +47,34 @@ __all__ = [
 # Patterns are built from config rather than hardcoded. Two surveyed copies of a
 # 319-line detector differed only by the brand name inside a regex, which is why the
 # brand is interpolated instead of written in.
+#: The thing an override targets: the instructions, whatever the writer calls them.
+#: Factored out because four patterns below need the same list, and three of them used to
+#: say only "instructions" - so "ignore all previous RULES" and "reveal your PROMPT" walked
+#: past a guard whose whole subject they were.
+_DIRECTIVE = r"(instruction|rule|prompt|direction|guideline|constraint)s?"
+
 _BASE_PATTERNS: tuple[str, ...] = (
-    r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions",
-    r"disregard\s+(the\s+)?(system|previous)\s+(prompt|instructions)",
+    rf"ignore\s+(all\s+|the\s+|any\s+|your\s+)*(previous|prior|above|earlier)?\s*{_DIRECTIVE}",
+    rf"disregard\s+(the\s+|all\s+|any\s+)*(system|previous|prior|above)\s+{_DIRECTIVE}",
+    rf"forget\s+(everything|all|your|the|any)\b[^.!?]{{0,40}}{_DIRECTIVE}",
+    rf"\bnew\s+(system\s+prompt|{_DIRECTIVE})\s*[:\-]",
     r"you\s+are\s+now\s+(a|an|in)\b",
-    r"(reveal|print|show|repeat)\s+(your|the)\s+(system\s+)?(prompt|instructions)",
+    rf"(reveal|print|show|repeat|output)\s+(your|the)\s+(system\s+)?({_DIRECTIVE}|prompt)",
     r"\bdeveloper\s+mode\b",
     r"\bpretend\s+(that\s+)?you\b",
     r"(bypass|skip|override)\s+(the\s+)?(confirmation|approval|checks?|guardrails?)",
+    rf"override\s+(the|your|all)\s+{_DIRECTIVE}",
     r"\bI\s+am\s+(the\s+)?(admin|administrator|root|owner)\b",
+    # A forged turn boundary. The model is shown a conversation, and markup that looks like
+    # the start of a system turn is the oldest way to inject one - it does not argue with
+    # the instructions, it appends to them. Cheap to match and impossible to write by
+    # accident in prose.
+    r"</?\s*(system|assistant|\|?im_start\|?|\|?im_end\|?)\s*>",
+    # "act as an unrestricted AI", "act as if you were DAN". Deliberately NOT the bare
+    # "act as a" that a first pass would write: "the trustee shall act as agent" and "the
+    # bank may act as custodian" are ordinary sentences in the documents this framework is
+    # pointed at, and a guard that fires on them teaches its readers to stop reading it.
+    r"act\s+as\s+(if\s+you|though\s+you|an?\s+[\w-]+\s*(AI|assistant|model|bot|LLM)\b)",
 )
 
 # Standing-authorisation patterns. Instruction *override* is only half the problem, and
