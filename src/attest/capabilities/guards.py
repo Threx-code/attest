@@ -30,7 +30,7 @@ from attest.kernel.warrants import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from attest.kernel.evidence import Evidence
     from attest.kernel.identifiers import EvidenceId, TenantId
@@ -239,10 +239,17 @@ class RedactionVault:
     that reads as corruption, so an unmatched token fails the run rather than shipping.
     """
 
-    __slots__ = ("_by_token",)
+    __slots__ = ("_by_token", "_labels")
 
     def __init__(self) -> None:
         self._by_token: dict[str, str] = {}
+        self._labels: set[str] = set()
+
+    #: Delimiters a model plausibly returns a token wrapped in, or strips it of. The token
+    #: is issued as ``[LABEL_n]`` and comes back as ``LABEL_n``, ``(LABEL_n)`` or
+    #: ``<LABEL_n>`` often enough that treating the brackets as load-bearing is what
+    #: produced the defect this class now tests for.
+    DELIMITERS: ClassVar[str] = r"\[\]\(\)\{\}<>\u27e8\u27e9"
 
     #: Below this a "value" is not an identifier, it is a substring of ordinary words.
     MIN_VALUE: ClassVar[int] = 2
@@ -264,6 +271,7 @@ class RedactionVault:
             )
         token = f"[{label}_{len(self._by_token) + 1}]"
         self._by_token[token] = value
+        self._labels.add(label)
         return token
 
     def apply(self, text: str) -> str:
@@ -281,18 +289,75 @@ class RedactionVault:
         return result
 
     def restore(self, text: str) -> str:
-        """Restore every token. Raises if any remains unmatched."""
+        r"""Restore every token. Raises if any remains unmatched.
+
+        **Tolerant about the delimiters, strict about the body.** This was
+        ``text.replace("[RC_1]", value)``, which is exact - so a model that returned the
+        token with its brackets normalised away left it unrestored, and the leftover check
+        below required the same brackets, so it did not catch that either. Both halves
+        assumed the delimiters survived, and the consumer got ``RC_1`` where a company
+        registration number belonged. Silently: the guarantee at the top of this class says
+        restoration is total, and it was total only against a model that echoed the token
+        byte for byte.
+
+        The body is ``re.escape``d and bounded by ``\b``, so ``RC_1`` never eats ``RC_10``,
+        and the longest token is tried first for the same reason.
+        """
         result = text
-        for token, value in self._by_token.items():
-            result = result.replace(token, value)
-        leftover = re.findall(r"\[[A-Z][A-Z_]*_\d+\]", result)
-        unknown = [t for t in leftover if t not in self._by_token]
+        for token in sorted(self._by_token, key=len, reverse=True):
+            result = self._token_pattern(token).sub(self._replacer(self._by_token[token]), result)
+        unknown = self._unrestored(result)
         if unknown:
             raise ValueError(
                 f"unrestored redaction token(s) {unknown} would reach the consumer as "
                 f"corrupted text; failing the run instead"
             )
         return result
+
+    @staticmethod
+    def _replacer(value: str) -> Callable[[re.Match[str]], str]:
+        """A substitution function, never a replacement template.
+
+        `re.sub` interprets backslashes and group references in a template string, and a
+        redacted value is arbitrary text - a name with a backslash, or the literal
+        characters ``\1``, would be rewritten on the way back in.
+        """
+
+        def replace(_match: re.Match[str]) -> str:
+            return value
+
+        return replace
+
+    def _token_pattern(self, token: str) -> re.Pattern[str]:
+        body = token.strip("[]")
+        return re.compile(rf"[{self.DELIMITERS}]?\b{re.escape(body)}\b[{self.DELIMITERS}]?")
+
+    def _unrestored(self, text: str) -> list[str]:
+        r"""Token-shaped text carrying a label THIS vault issued, still present.
+
+        Keyed on the issued labels rather than on the shape alone, and that distinction is
+        the difference between a check and a nuisance. ``[A-Z][A-Z_]*_\d+`` also matches
+        ``SCHEDULE_1``, ``EXHIBIT_2`` and ``ANNEX_3``, which are ordinary text in the
+        documents this framework is pointed at - failing a run on one would be a guard
+        teaching its readers to route around it.
+        """
+        # Bracketed: unambiguous whatever the label. Nobody writes "[OTHER_9]" in prose,
+        # so a token shape inside delimiters is corruption on sight - including one this
+        # vault never issued, which is the case where a caller mixed two vaults.
+        found = {m.group(0) for m in re.finditer(r"\[[A-Z][A-Z_]*_\d+\]", text)}
+
+        # Bare: flagged only for a label THIS vault issued, and that distinction is the
+        # difference between a check and a nuisance. `[A-Z][A-Z_]*_\d+` without delimiters
+        # also matches SCHEDULE_1, EXHIBIT_2 and ANNEX_3, which are ordinary text in the
+        # documents this framework is pointed at - failing a run on one would be a guard
+        # teaching its readers to route around it.
+        if self._labels:
+            labels = "|".join(re.escape(label) for label in sorted(self._labels))
+            bare = re.compile(
+                rf"(?<![{self.DELIMITERS}])\b(?:{labels})_\d+\b(?![{self.DELIMITERS}])"
+            )
+            found |= {m.group(0) for m in bare.finditer(text)}
+        return sorted(found)
 
     def __len__(self) -> int:
         return len(self._by_token)

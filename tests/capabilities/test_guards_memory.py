@@ -146,6 +146,93 @@ def test_restoration_is_total_or_the_run_fails() -> None:
         vault.restore("[PERSON_99] is eligible")
 
 
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "echoed",
+    [
+        "The company [RC_1] shall execute this deed.",
+        "The company (RC_1) shall execute this deed.",
+        "The company <RC_1> shall execute this deed.",
+        "The company RC_1 shall execute this deed.",
+    ],
+)
+def test_a_token_is_restored_whatever_the_model_did_to_its_delimiters(echoed: str) -> None:
+    """`restore` was `text.replace("[RC_1]", value)`, which is exact.
+
+    A model that echoed the token with its brackets normalised away left it unrestored, and
+    the leftover check required the same brackets so it did not catch that either - both
+    halves assumed the delimiters survived. The consumer got `RC_1` where a company
+    registration number belonged, silently, while this class promised total restoration.
+    """
+    vault = RedactionVault()
+    vault.redact("RC 123456", "RC")
+
+    assert "RC 123456" in vault.restore(echoed)
+
+
+@pytest.mark.security
+def test_a_longer_token_is_not_eaten_by_a_shorter_one() -> None:
+    """`RC_1` must not consume `RC_10`. Longest first, and `\b` on both ends."""
+    vault = RedactionVault()
+    for _ in range(10):
+        vault.redact("filler value", "RC")
+    tenth = vault.redact("the tenth value", "RC")
+
+    assert vault.restore(f"see {tenth}") == "see the tenth value"
+
+
+@pytest.mark.security
+def test_an_unissued_label_in_brackets_still_fails() -> None:
+    """Nobody writes "[OTHER_9]" in prose, so a token shape inside delimiters is corruption
+    on sight - including one this vault never issued, which is a caller mixing two vaults."""
+    vault = RedactionVault()
+    vault.redact("John Smith", "NAME")
+
+    with pytest.raises(ValueError, match="unrestored redaction token"):
+        vault.restore("the answer mentions [OTHER_9]")
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "See SCHEDULE_1 for the payment terms.",
+        "The definitions in EXHIBIT_2 apply throughout.",
+        "Refer to ANNEX_3 and PART_4 of the agreement.",
+    ],
+)
+def test_document_references_are_not_mistaken_for_tokens(prose: str) -> None:
+    r"""The other half of the fix, and the reason the bare form is scoped to issued labels.
+
+    `[A-Z][A-Z_]*_\d+` without delimiters matches the cross-references that fill the
+    documents this framework is pointed at. Failing a run on `SCHEDULE_1` would be a guard
+    teaching its readers to route around it.
+    """
+    vault = RedactionVault()
+    vault.redact("John Smith", "NAME")
+
+    assert vault.restore(prose) == prose
+
+
+@pytest.mark.security
+def test_a_bare_token_for_an_issued_label_still_fails() -> None:
+    """Tolerance about delimiters must not become tolerance about losing a value."""
+    vault = RedactionVault()
+    vault.redact("John Smith", "NAME")
+
+    with pytest.raises(ValueError, match="unrestored redaction token"):
+        vault.restore("the answer mentions NAME_7")
+
+
+def test_a_value_containing_a_backslash_survives_restoration() -> None:
+    """`re.sub` interprets a replacement TEMPLATE, so a value carrying `\1` or a backslash
+    would be rewritten on the way back in. The substitution is a function for that reason."""
+    vault = RedactionVault()
+    token = vault.redact(r"C:\Users\ada", "PATH")
+
+    assert vault.restore(f"stored at {token}") == r"stored at C:\Users\ada"
+
+
 def test_the_vault_tracks_how_many_values_it_holds() -> None:
     vault = RedactionVault()
     vault.redact("John Smith", "PERSON")
