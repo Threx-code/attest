@@ -14,6 +14,7 @@ materially different decision, and by the time the run ends the routing state is
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
@@ -1339,3 +1340,130 @@ def test_a_provider_whose_spec_claims_streaming_it_lacks_is_skipped() -> None:
 
     assert list(gateway.session(context()).stream(request())) == ["one ", "two"]
     assert liar.calls == []
+
+
+# ── Zero retention ───────────────────────────────────────────────────────────
+#
+# `ProviderRouter` honoured `zero_retention_required` from the day it was written, and
+# `ModelGateway.router_for` never passed it. Since the gateway is the only supported way
+# to reach a provider, the one flag that keeps a tenant's text off a retaining provider
+# could not be switched on at all.
+
+
+def retaining(name: str, *, zero_retention: bool = False, region: str = "eu-west-2") -> Provider:
+    provider = Provider(name, region=region)
+    provider._spec = ProviderSpec(
+        name=name,
+        model_id="claude-opus-5",
+        family="claude",
+        region=region,
+        zero_retention=zero_retention,
+    )
+    return provider
+
+
+def test_a_zero_retention_tenant_never_reaches_a_retaining_provider() -> None:
+    """The defect, stated as the outcome: the retaining provider is not asked."""
+    retains = retaining("retains")
+    attested = retaining("attested", zero_retention=True)
+    gateway = ModelGateway([retains, attested], pricing=pricing(), clock=Clock())
+
+    binding = context()
+    binding = replace(binding, binding=replace(binding.binding, zero_retention_required=True))
+
+    assert gateway.session(binding).complete(request()).provider == "attested"
+    assert retains.calls == [], "a zero-retention tenant's text reached a retaining provider"
+
+
+def test_a_zero_retention_tenant_with_nobody_attested_refuses() -> None:
+    """An empty attested set means nobody has attested, which is not the same as
+    everybody having attested."""
+    gateway = ModelGateway([retaining("retains")], pricing=pricing(), clock=Clock())
+
+    binding = context()
+    binding = replace(binding, binding=replace(binding.binding, zero_retention_required=True))
+
+    with pytest.raises(ResidencyRefused):
+        gateway.session(binding).complete(request())
+
+
+def test_a_tenant_that_did_not_ask_for_zero_retention_is_unaffected() -> None:
+    """The no-adoption path. `False` is the default and must change nothing."""
+    gateway = ModelGateway([retaining("retains")], pricing=pricing(), clock=Clock())
+
+    assert gateway.session(context()).complete(request()).provider == "retains"
+
+
+def test_the_flag_is_part_of_what_the_binding_hashes() -> None:
+    """A binding whose residency terms differ is a different binding. If the hash did not
+    move, two runs under opposite retention rules would be indistinguishable in the
+    attestation that records which binding applied."""
+    plain = context().binding
+    strict = replace(plain, zero_retention_required=True)
+
+    assert plain.content_hash() != strict.content_hash()
+
+
+# ── The deployment residency floor ───────────────────────────────────────────
+#
+# Residency came from the binding alone, and the binding defaults to empty meaning
+# unconstrained - so an air-gapped deployment's whole control was held by whoever
+# assembled the binding, with nothing above them able to guarantee it. Everywhere else in
+# this module absence is restrictive on purpose. Residency alone read absence as permission.
+
+
+def test_a_binding_that_declares_nothing_still_gets_the_deployment_floor() -> None:
+    """The defect, stated as the outcome: an empty binding no longer means anywhere."""
+    inside = Provider("onprem", region="onprem")
+    outside = Provider("hosted", region="us-east-1")
+    gateway = ModelGateway(
+        [outside, inside],
+        pricing=pricing(),
+        clock=Clock(),
+        residency_floor=frozenset({"onprem"}),
+    )
+
+    assert gateway.session(context()).complete(request()).provider == "onprem"
+    assert outside.calls == []
+
+
+def test_a_binding_cannot_widen_the_floor() -> None:
+    """A tenant asking for a region the deployment does not permit is a refusal, not a
+    negotiation. This is the air-gapped case: the binding is the layer least able to
+    guarantee the boundary, so it may narrow and never widen."""
+    hosted = Provider("hosted", region="us-east-1")
+    gateway = ModelGateway(
+        [hosted],
+        pricing=pricing(),
+        clock=Clock(),
+        residency_floor=frozenset({"onprem"}),
+    )
+
+    with pytest.raises(ResidencyRefused):
+        gateway.session(context(regions=frozenset({"us-east-1"}))).complete(request())
+    assert hosted.calls == []
+
+
+def test_a_binding_may_narrow_the_floor() -> None:
+    """Narrowing is the legitimate direction and must keep working."""
+    eu = Provider("eu", region="eu-west-2")
+    uk = Provider("uk", region="uk-south")
+    gateway = ModelGateway(
+        [uk, eu],
+        pricing=pricing(),
+        clock=Clock(),
+        residency_floor=frozenset({"eu-west-2", "uk-south"}),
+    )
+
+    response = gateway.session(context(regions=frozenset({"eu-west-2"}))).complete(request())
+    assert response.provider == "eu"
+    assert uk.calls == []
+
+
+def test_a_deployment_that_sets_no_floor_is_unaffected() -> None:
+    """The no-adoption path."""
+    gateway = ModelGateway(
+        [Provider("anywhere", region="us-east-1")], pricing=pricing(), clock=Clock()
+    )
+
+    assert gateway.session(context()).complete(request()).provider == "anywhere"

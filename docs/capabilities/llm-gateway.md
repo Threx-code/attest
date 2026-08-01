@@ -43,6 +43,26 @@ dependency-free local embedding provider for tests and air-gapped deployments.
 silently degrading it — a failover that drops tool-calling support mid-run is worse than an
 error.
 
+## Residency and retention
+
+Both come from `TenantBinding`, never from a constructor argument, because an argument is a
+thing a caller can forget while still producing an attestation that records the binding.
+
+`zero_retention_required` filters the chain to providers that have attested it. `ProviderRouter`
+honoured this from the day it was written and `router_for` never passed it, so the one flag that
+keeps a tenant's text off a retaining provider could not be switched on through the only
+supported way to reach a provider. An empty attested set is then a refusal, and correctly:
+nobody having attested is not the same as everybody having attested.
+
+`residency_floor` is the **deployment's** permitted regions, which a binding may narrow and may
+not widen. Without it residency was set entirely by whoever assembled the binding, and a binding
+that omitted it — the default — was unconstrained; for an air-gapped deployment that is the whole
+control, held by the layer least able to guarantee it. A binding asking for a region outside the
+floor is a refusal, not a negotiation. Empty by default.
+
+Note what that closes. Everywhere else here absence is restrictive on purpose — an undeclared
+capability is absent, an undeclared tier ranks lowest. Residency alone read absence as permission.
+
 ## Resilience
 
 ```

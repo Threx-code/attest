@@ -51,6 +51,7 @@ from attest.kernel.canonical import NULL_HASH, Canonical
 from attest.kernel.effects import EffectState
 from attest.kernel.errors import ContractViolation
 from attest.kernel.identifiers import Hash, RunId, RunIds
+from attest.kernel.ports import AutonomyMode, AutonomyStore
 from attest.kernel.verdicts import Verdict
 
 if TYPE_CHECKING:
@@ -114,31 +115,6 @@ class Operator:
                 "an operation must name who performed it. An anonymous kill switch is "
                 "indistinguishable from a misconfiguration when the incident is reviewed."
             )
-
-
-class AutonomyMode:
-    """How much a capability may do without a human. Mirrors the stored vocabulary."""
-
-    AUTO = "auto"
-    APPROVE = "approve"
-    BLOCKED = "blocked"
-
-    ALL = (AUTO, APPROVE, BLOCKED)
-
-
-@runtime_checkable
-class AutonomyStore(Protocol):
-    """Where the kill switch lives.
-
-    A row rather than a deploy, because a control you can only exercise by shipping
-    code is not a control you can exercise during an incident.
-    """
-
-    def set_mode(
-        self, *, tenant: TenantId, capability: str, mode: str, enabled: bool, by: str
-    ) -> None: ...
-
-    def modes(self, *, tenant: TenantId | None = None) -> Sequence[Mapping[str, object]]: ...
 
 
 @runtime_checkable

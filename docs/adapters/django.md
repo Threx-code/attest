@@ -153,6 +153,22 @@ incident is reviewed.
 Nothing is mounted automatically. A route that can disable a capability should be a line
 somebody wrote on purpose.
 
+### The switch is read on the run path
+
+Wire `DjangoAutonomyStore` into `RunEngine(autonomy=...)` and every proposed effect asks it
+first. Without that argument the engine has no opinion and behaves exactly as before, which
+is deliberate: the store answers `blocked` for a capability with no row, on the ground that
+an absent policy is an unanswered question rather than permission, so wiring it is a real
+commitment and should be visible in the wiring rather than hidden in a default.
+
+A store that cannot answer blocks. Not knowing whether the switch is on is not the same as
+it being off, and the whole point of this control is the incident during which the
+infrastructure is already unwell.
+
+Only `blocked` is enforced here. `approve` means the capability may act with a human in the
+loop, which is what the profile's `Approval` obligation already expresses - implementing it
+twice would put approval policy in two places, and the second one would drift.
+
 ## Serialisers preserve warnings
 
 A specific hazard called out in [`../concepts/verdicts.md`](../concepts/verdicts.md): an

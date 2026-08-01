@@ -146,6 +146,25 @@ class TenantBinding:
     Constrains the *model provider*, not only the database — a fallback provider in
     another region turns an outage into a data-transfer breach, so the gateway
     filters its failover list by residency before consulting it, never after.
+
+    A **deployment** floor may sit above this - see
+    :class:`~attest.capabilities.gateway.ModelGateway`. This value can then only narrow
+    it, never widen it.
+    """
+
+    zero_retention_required: bool = False
+    """Whether this tenant's calls may only go to a provider that has attested it.
+
+    On the binding rather than on the gateway constructor because it is a tenant's
+    contractual position, not a process-wide one, and because a constructor argument is
+    a thing a caller can forget while still producing an attestation that records the
+    binding. ``ProviderRouter`` has honoured this since it was written; nothing passed
+    it, so it could not be switched on through the only supported way to reach a
+    provider.
+
+    ``False`` is the honest default and is not the same as "nobody needs it": it means
+    this tenant has not asked. A deployment where nobody has attested is a deployment
+    where the flag filters everything out, which is a refusal and correct.
     """
 
     def content_hash(self) -> Hash:
@@ -160,6 +179,7 @@ class TenantBinding:
                     },
                     "config_hash": self.config_hash,
                     "residency_regions": sorted(self.residency_regions),
+                    "zero_retention_required": self.zero_retention_required,
                 }
             )
         )

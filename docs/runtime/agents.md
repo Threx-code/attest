@@ -37,8 +37,7 @@ class AgentSpec:
     tools: Sequence[str] = ()
     max_steps: int = 8
 
-    # warrants
-    evidence_required: bool = True
+    # warrants — tightening only
     warrant_overrides: Mapping[WarrantKind, WarrantPolicy] = field(default_factory=dict)
 
     # remit — what this agent may and may not address
@@ -48,7 +47,29 @@ class AgentSpec:
 
 `model_tier` rather than a model id. The concrete model comes from config, so switching
 providers is a config change and never fifty edits. This pattern already exists in one
-surveyed codebase and is worth keeping.
+surveyed codebase and is worth keeping. `AgentSpec.completion_floor()` hands it to the
+gateway as `CompletionRequest.min_tier`, so a frontier-tier agent is not served by a small
+fast model on failover - feature parity is not quality parity, and a down-tiered answer is
+structurally identical to a good one.
+
+### An agent may tighten, and may not loosen
+
+`warrant_overrides` is resolved against the profile's policy by
+`WarrantPolicy.strictest()`, the same comparison `ProfileComposer` uses when composing two
+profiles. So a supervisor that BLOCKs on the boundary warrant while its deployment only
+WARNs is a deployment choosing to be careful about one agent, and the reverse - an agent
+quietly relaxing a policy its deployment set - cannot happen. `NON_DOWNGRADEABLE` still
+sits above all of it: no policy from any source softens a tenancy crossing.
+
+Pass the spec on `RunRequest.agent`. Omit it and nothing changes, which is what a rules
+engine, a scheduled job or a human proposing through the same shape wants.
+
+**`evidence_required` was removed.** It read as a control and could never be one: EPISTEMIC
+is in `CORE_WARRANTS`, so every profile already evaluates it, and `EvidenceEngine.evaluate`
+already fails an empty set with `no_evidence`. `True` could add nothing and `False` must
+not remove anything, which left a field whose only possible effect was to mislead whoever
+set it. An agent that wants to be stricter about evidence uses `warrant_overrides`; a
+deployment that wants to be looser is the profile's call.
 
 ## Scope is enforced at every boundary, not just the response
 
