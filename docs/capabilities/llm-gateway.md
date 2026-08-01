@@ -141,6 +141,26 @@ Every call is priced and attributed. Budget enforcement happens at
 The pricing table is versioned and pinned into the attestation. Prices change; a
 historical cost figure that silently re-prices at today's rate is not an audit record.
 
+### A model with no rate
+
+`PricingTable.price` raises for a model it does not list, and is right to: a zero in a
+financial record that means "we had no rate" is a fabricated number.
+
+The gateway does not raise. Pricing happens *after* the provider has answered and billed, so
+an unlisted model used to discard a completion the deployment had already paid for and hand
+the caller an exception instead of the answer — refusing to state a cost had become refusing
+to serve. A consuming project cannot pre-empt it either, because a model id is deployment
+configuration rather than a catalogue somebody can enumerate.
+
+So `ModelCall.amount` is `str | None`, and `None` is the honest value: the call happened, the
+tokens are counted, the money is real, and the rate is unknown. `ModelCallLog.unpriced()`
+names the models so somebody can add the rates, and `complete()` is `False` until they do —
+the same treatment `streams_abandoned` gets, for the same reason.
+
+`cost()` keeps the tokens of an unpriced call and omits its money. Only the rate was missing;
+the counts are as real as any other call's, and dropping them would lose information the
+deployment does have.
+
 ## Drift detection
 
 The capability none of the surveyed systems have, and the one that matters most for

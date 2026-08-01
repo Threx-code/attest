@@ -443,7 +443,20 @@ class ModelCall:
     input_tokens: int
     output_tokens: int
     cached_tokens: int
-    amount: str
+    amount: str | None
+    """What this call cost, or ``None`` where no rate was available.
+
+    ``None`` rather than ``"0"``, for the reason :meth:`PricingTable.price` refuses to
+    return a zero: a zero meaning free and a zero meaning "we never found out" read
+    identically once written. This is the second one, said out loud.
+
+    It exists because refusing to state a cost had become refusing to serve. ``_price``
+    ran after the provider had answered and billed, so an unlisted model raised and the
+    run lost a completion it had already paid for. The call happened, the tokens are
+    counted, the money is real, and the rate is unknown - which is a value this framework
+    already has a way to say.
+    """
+
     failover: bool
     attempted: tuple[str, ...] = ()
     """Providers tried before this one answered. Empty on a first-attempt success."""
@@ -503,14 +516,34 @@ class ModelCallLog:
     than coercing to a number - see :meth:`complete`.
     """
 
+    def unpriced(self) -> tuple[str, ...]:
+        """Models that answered and could not be priced, in order, without repeats.
+
+        Named rather than counted, for the reason :attr:`streams_abandoned` names its
+        providers: "one call could not be priced" is an alert nobody can act on, and
+        "claude-opus-9 has no rate in table 2026-07-01" is a line somebody adds.
+        """
+        return tuple(dict.fromkeys(c.model_id for c in self.calls if c.amount is None))
+
     def cost(self) -> CostRecord:
-        """The run's total, summed from what was actually charged."""
+        """The run's total, summed from what was actually charged.
+
+        Unpriced calls contribute their **tokens** and not an amount. Their tokens are
+        known and are as real as any other's; only the rate is missing, and dropping the
+        counts as well would lose information the deployment does have. The money they
+        cost is absent from the total, which is what :meth:`complete` is for.
+        """
         return CostRecord(
             input_tokens=sum(call.input_tokens for call in self.calls),
             output_tokens=sum(call.output_tokens for call in self.calls),
             cached_tokens=sum(call.cached_tokens for call in self.calls),
             currency=self.currency,
-            amount=str(sum((Decimal(call.amount) for call in self.calls), Decimal(0))),
+            amount=str(
+                sum(
+                    (Decimal(c.amount) for c in self.calls if c.amount is not None),
+                    Decimal(0),
+                )
+            ),
             pricing_version=self.pricing_version,
         )
 
@@ -521,8 +554,12 @@ class ModelCallLog:
         here and cannot be, so the total under-reports by an amount nobody in this
         process knows. Anything reconciling against a provider invoice needs telling,
         rather than inferring completeness from a figure that looks complete.
+
+        ``False`` too when any call went unpriced. Same sentence, different cause: the
+        tokens are in the total and the money is not, so the figure is short by an amount
+        that is knowable later and is not knowable here.
         """
-        return not self.streams_abandoned
+        return not self.streams_abandoned and not self.unpriced()
 
     def model_ref(self) -> ModelRef | None:
         """The model that produced the run's output — the last one to answer.
@@ -1434,6 +1471,42 @@ class ModelGateway:
         if self._semantic is not None:
             self._semantic.store(request, response, model_id=provider.spec.model_id)
 
+    def _amount(self, response: CompletionResponse, *, cached_tokens: int) -> str | None:
+        """What the call cost, or ``None`` where the table has no rate for the model.
+
+        `PricingTable.price` raises, and it is right to: a zero in a financial record
+        that means "we had no rate" is a fabricated number. But this ran AFTER the
+        provider had answered and billed, so an unlisted model discarded a completion the
+        deployment had already paid for and handed the caller an exception instead of the
+        answer. Refusing to state a cost had become refusing to serve.
+
+        A consuming project cannot pre-empt it either. A model id is deployment
+        configuration - an administrator types it into a field - so there is no catalogue
+        to build a complete table from, and the alternatives are each worse than the
+        defect: ship a table and break every deployment running a model its author had
+        not heard of, catch the error and discard the completion, or register a zero rate
+        and tell the lie one layer up where nothing can see it.
+
+        So the miss is typed rather than raised. The call happened, the tokens are
+        counted, the money is real, and the rate is unknown - the same event as an
+        abandoned stream, and this framework's whole argument is that ``UNKNOWN`` is a
+        value rather than an error. `ModelCallLog.unpriced` names the model so somebody
+        can add the rate, and `complete()` says the total is short until they do.
+
+        The strict primitive is untouched: `PricingTable.price` still raises for anyone
+        who calls it directly, which is where a deployment that wants a hard failure puts
+        its check.
+        """
+        try:
+            return self.pricing.price(
+                response.model_id,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                cached=cached_tokens,
+            )
+        except KeyError:
+            return None
+
     def _price(
         self,
         response: CompletionResponse,
@@ -1445,16 +1518,7 @@ class ModelGateway:
         cached: bool,
     ) -> ModelCall:
         cached_tokens = int(response.metadata.get("cached_input_tokens", "0") or 0)
-        amount = (
-            "0"
-            if cached
-            else self.pricing.price(
-                response.model_id,
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
-                cached=cached_tokens,
-            )
-        )
+        amount = "0" if cached else self._amount(response, cached_tokens=cached_tokens)
         return ModelCall(
             provider=response.provider,
             model_id=response.model_id,

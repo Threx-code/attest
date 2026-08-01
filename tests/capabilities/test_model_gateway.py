@@ -356,7 +356,9 @@ def test_a_call_is_priced_from_the_pinned_table() -> None:
     ).session(context())
     session.complete(request())
     # 1M input at $5 + 1M output at $25.
-    assert Decimal(session.log().calls[0].amount) == Decimal("30")
+    amount = session.log().calls[0].amount
+    assert amount is not None, "a listed model must be priced, not typed as unknown"
+    assert Decimal(amount) == Decimal("30")
 
 
 def test_cached_input_is_billed_at_the_cached_rate() -> None:
@@ -365,7 +367,9 @@ def test_cached_input_is_billed_at_the_cached_rate() -> None:
         [Provider("p", tokens=(1_000_000, 0), cached=1_000_000)], pricing=pricing(), clock=Clock()
     ).session(context())
     session.complete(request())
-    assert Decimal(session.log().calls[0].amount) == Decimal("0.5")
+    amount = session.log().calls[0].amount
+    assert amount is not None
+    assert Decimal(amount) == Decimal("0.5")
 
 
 def test_the_log_totals_every_call_and_pins_the_pricing_version() -> None:
@@ -1467,3 +1471,113 @@ def test_a_deployment_that_sets_no_floor_is_unaffected() -> None:
     )
 
     assert gateway.session(context()).complete(request()).provider == "anywhere"
+
+
+# ── An unpriced model ────────────────────────────────────────────────────────
+#
+# `_price` ran after the provider had answered and billed, so a model the table did not
+# list raised `KeyError` and the run lost a completion it had already paid for. Refusing
+# to state a cost had become refusing to serve - and a consuming project cannot pre-empt
+# it, because a model id is deployment configuration rather than a catalogue.
+
+
+def test_a_model_with_no_rate_is_still_served() -> None:
+    """The defect, stated as the outcome: the answer comes back."""
+    gateway = ModelGateway(
+        [Provider("p", model_id="a-model-nobody-listed")], pricing=pricing(), clock=Clock()
+    )
+
+    response = gateway.session(context()).complete(request())
+
+    assert response.text == "answered"
+
+
+def test_an_unpriced_call_says_unknown_rather_than_zero() -> None:
+    """A zero meaning free and a zero meaning 'we never found out' read identically once
+    written, which is why `PricingTable.price` refuses to return one."""
+    gateway = ModelGateway(
+        [Provider("p", model_id="a-model-nobody-listed")], pricing=pricing(), clock=Clock()
+    )
+    session = gateway.session(context())
+
+    session.complete(request())
+
+    assert session.log().calls[0].amount is None
+
+
+def test_the_unpriced_model_is_named() -> None:
+    """'One call could not be priced' is an alert nobody can act on. The model id is a
+    line somebody adds to the table."""
+    gateway = ModelGateway(
+        [Provider("p", model_id="a-model-nobody-listed")], pricing=pricing(), clock=Clock()
+    )
+    session = gateway.session(context())
+
+    session.complete(request())
+
+    assert session.log().unpriced() == ("a-model-nobody-listed",)
+
+
+def test_an_unpriced_call_keeps_its_tokens() -> None:
+    """Only the rate is missing. The counts are as real as any other call's, and dropping
+    them would lose information the deployment does have."""
+    gateway = ModelGateway(
+        [Provider("p", model_id="unlisted", tokens=(1000, 500))],
+        pricing=pricing(),
+        clock=Clock(),
+    )
+    session = gateway.session(context())
+
+    session.complete(request())
+
+    cost = session.log().cost()
+    assert (cost.input_tokens, cost.output_tokens) == (1000, 500)
+    assert cost.amount == "0", "an unknown rate must not invent a number in the total"
+
+
+def test_the_total_says_it_is_short_rather_than_looking_whole() -> None:
+    """The money is absent from the total and the caller has to be told, rather than
+    inferring completeness from a figure that looks complete."""
+    gateway = ModelGateway([Provider("p", model_id="unlisted")], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    session.complete(request())
+
+    assert not session.log().complete()
+
+
+def test_a_fully_priced_run_is_unchanged() -> None:
+    """The no-regression path: a log with every rate available still reports itself whole."""
+    gateway = ModelGateway([Provider("p")], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    session.complete(request())
+
+    log = session.log()
+    assert log.complete()
+    assert log.unpriced() == ()
+    assert log.cost().amount == "0.017500"
+
+
+def test_a_mixed_run_totals_the_calls_it_could_price() -> None:
+    """A run that used one listed model and one unlisted one reports the money it knows
+    about, not zero and not a guess."""
+    listed = Provider("listed")
+    unlisted = Provider("unlisted", model_id="no-rate-for-this")
+    gateway = ModelGateway([listed, unlisted], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    session.complete(request(cacheable=False))
+    session.complete(request(messages=("a different question",), cacheable=False))
+
+    log = session.log()
+    assert log.cost().amount == "0.035000", "both calls went to the first candidate"
+    assert log.complete()
+
+
+def test_the_pricing_table_itself_still_refuses_to_guess() -> None:
+    """The strict primitive does not soften. A deployment that wants a hard failure calls
+    it directly; the gateway is the layer that has a completion in hand and must not throw
+    it away."""
+    with pytest.raises(KeyError):
+        pricing().price("unlisted", input_tokens=1, output_tokens=1)
