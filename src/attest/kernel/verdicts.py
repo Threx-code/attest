@@ -110,6 +110,14 @@ CORE_REFUSAL_REASONS: Final[frozenset[RefusalReason]] = frozenset(
             "policy_downgrade",
             "residency_unavailable",
             "evidence_source_unreachable",
+            # The failover chain ran out of time rather than out of providers. Distinct
+            # from the one above because the remedy is distinct: "every provider failed"
+            # sends an operator to look at routing, and the routing was fine.
+            "deadline_exceeded",
+            # A stream failed after bytes had already reached the reader. Not a failover:
+            # re-emitting from a second provider shows the reader the answer twice, so
+            # truncation is the honest outcome and is recorded as one.
+            "stream_interrupted",
             "contradictory_policy",
             "no_counterfactual_available",
         ),

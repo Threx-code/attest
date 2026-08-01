@@ -110,6 +110,38 @@ chunk:
 A per-chunk guard failure **terminates the stream immediately** and settles as `REFUSE`. It
 does not wait for generation to finish.
 
+## Where the chunks come from
+
+`StreamSession` governs a stream; it does not produce one. The tokens come from
+[`ModelGateway.stream()`](../capabilities/llm-gateway.md), which applies residency, tier,
+the breaker, the retry policy, the chain deadline and the idempotency key exactly as a
+completion does, and the two meet here:
+
+```python
+session = StreamSession(spec)
+tokens = gateway.session(context).stream(request)
+
+try:
+    for chunk in tokens:
+        session.emit(chunk)          # per-chunk guards run on the way out
+except StreamInterrupted as interrupted:
+    session.terminate(interrupted.refusal)
+```
+
+Two failures, kept distinct on purpose:
+
+- **`session.terminate(...)`** is *this* boundary refusing to let something out. The content
+  was generated and must not be shown.
+- **`StreamInterrupted`** is the provider dropping the connection after bytes had already
+  been read. Nothing was refused; the answer is simply short. The exception carries the
+  partial text so the caller can decide what to show, and the gateway deliberately does not
+  fail over: re-emitting from a second provider makes the reader watch the answer start
+  again, which is worse than watching it stop.
+
+A reader that disconnects is neither. Closing the generator records the abandonment on the
+run's `ModelCallLog`, because the provider kept generating and billing after the reader had
+gone.
+
 ## Attestation shape is unchanged
 
 Streaming adds fields; it does not change the artifact:
