@@ -15,7 +15,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final, NewType
+from typing import TYPE_CHECKING, Final, NewType
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = [
     "CORE_WARRANTS",
@@ -121,6 +124,39 @@ class WarrantPolicy(StrEnum):
     HOLD = "hold"
     WARN = "warn"
     RECORD = "record"
+
+    @property
+    def rank(self) -> int:
+        """How strict this is. Higher is stricter.
+
+        Here rather than on whoever needs it, because two places already needed it and a
+        third was about to. Composing profiles takes the stricter of two opinions, and an
+        agent may tighten its own warrant policy and may not loosen it - the same
+        comparison, and a second copy of this ordering would eventually disagree with the
+        first in the direction that lets something through.
+        """
+        return _POLICY_RANK[self]
+
+    @classmethod
+    def strictest(cls, *policies: WarrantPolicy | None) -> WarrantPolicy:
+        """The strictest of the given policies, ignoring ``None``.
+
+        ``None`` is no opinion, not a permissive one. A caller that has not expressed a
+        policy must not be able to weaken one that has - which is the entire direction
+        this method exists to enforce.
+        """
+        stated = [p for p in policies if p is not None]
+        if not stated:
+            raise ValueError("strictest() needs at least one stated policy")
+        return max(stated, key=lambda p: p.rank)
+
+
+_POLICY_RANK: Final[Mapping[WarrantPolicy, int]] = {
+    WarrantPolicy.RECORD: 0,
+    WarrantPolicy.WARN: 1,
+    WarrantPolicy.HOLD: 2,
+    WarrantPolicy.BLOCK: 3,
+}
 
 
 NON_DOWNGRADEABLE: Final[frozenset[str]] = frozenset(

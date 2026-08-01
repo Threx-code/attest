@@ -942,6 +942,7 @@ class ModelGateway:
         "_clock",
         "_jitter",
         "_providers",
+        "_residency_floor",
         "_retry",
         "_semantic",
         "_sleep",
@@ -964,6 +965,7 @@ class ModelGateway:
         jitter: Callable[[], float] | None = None,
         tier_order: Sequence[str] = (),
         total_deadline: timedelta | None = None,
+        residency_floor: frozenset[str] = frozenset(),
     ) -> None:
         """Assemble the gateway.
 
@@ -977,6 +979,23 @@ class ModelGateway:
         is empty by default: a deployment that does not model tiers gets exactly the
         previous behaviour. Naming the tiers here would be domain knowledge, so the
         package only ever compares positions in a list somebody else supplied.
+
+        ``total_deadline`` bounds the WHOLE chain in wall-clock terms, and is ``None``
+        by default. Without one the timeouts compound: an SDK's own retries, times
+        :class:`RetryPolicy`'s attempts, times every candidate. A single logical call
+        can then hold a provider for minutes while every layer believes it is being
+        patient. Survivable on a worker, not on a request thread, and the gateway
+        cannot tell which it is on - so the deployment says. Read from ``clock``, whose
+        contract already requires monotonicity within a run, rather than from
+        ``time.monotonic()``: that keeps a deadline reproducible in a replay instead of
+        making it the ambient time this package bans everywhere else.
+
+        ``residency_floor`` is the DEPLOYMENT's permitted regions, which a tenant
+        binding may narrow and may not widen. Empty by default, which is the previous
+        behaviour: residency came from the binding alone, and a binding that left it
+        empty - the default - was unconstrained. An air-gapped deployment's whole
+        control was therefore held by whoever assembled the binding, with nothing above
+        them able to guarantee it.
         """
         if not providers:
             raise ConfigurationError("a ModelGateway needs at least one provider")
@@ -991,6 +1010,7 @@ class ModelGateway:
         self._jitter = jitter if jitter is not None else self._default_jitter
         self._tier_order = tuple(tier_order)
         self._total_deadline = total_deadline
+        self._residency_floor = residency_floor
 
     @staticmethod
     def _new_idempotency_key() -> str:
@@ -1078,11 +1098,60 @@ class ModelGateway:
         return ModelSession(self, context)
 
     def router_for(self, context: ExecutionContext) -> ProviderRouter:
-        """The router this run's binding implies. Regions are never a parameter."""
+        """The router this run's binding implies. Regions are never a parameter.
+
+        Zero retention comes from the binding too. It is a tenant's contractual
+        position rather than a process-wide one, and `ProviderRouter` has honoured it
+        since it was written - nothing passed it, so the one flag that keeps a tenant's
+        text off a retaining provider could not be switched on through the only
+        supported way to reach a provider.
+        """
         return ProviderRouter(
-            permitted_regions=context.binding.residency_regions,
+            permitted_regions=self._regions_for(context),
+            zero_retention_required=context.binding.zero_retention_required,
             tier_order=self._tier_order,
         )
+
+    def _regions_for(self, context: ExecutionContext) -> frozenset[str]:
+        """The binding's regions, narrowed by the deployment floor.
+
+        A binding could previously widen residency to anywhere by leaving it empty, and
+        empty is its default - so residency was set entirely by whoever assembled the
+        binding, with nothing above them. For an air-gapped deployment that is the whole
+        control, held by the layer least able to guarantee it.
+
+        Note the asymmetry this closes. Everywhere else in this module absence is
+        restrictive on purpose: an undeclared capability is absent, an undeclared tier
+        ranks lowest. Residency alone read absence as permission.
+
+        The intersection, not the union: a tenant may narrow the deployment's list and
+        may not reach outside it.
+
+        An empty intersection **refuses here** rather than being passed down. Empty means
+        unconstrained to `select`, so returning it would turn "this tenant asked for a
+        region the deployment forbids" into "this tenant asked for nothing in particular"
+        and serve the call from anywhere - inverting the control at the exact moment it
+        was doing its job.
+        """
+        binding = context.binding.residency_regions
+        if not self._residency_floor:
+            return binding
+        if not binding:
+            return self._residency_floor
+        permitted = self._residency_floor & binding
+        if not permitted:
+            raise ResidencyRefused(
+                Refusal(
+                    reason=RefusalReason("residency_unavailable"),
+                    detail=(
+                        f"tenant {context.identity.tenant!r} is bound to "
+                        f"{sorted(binding)}, and this deployment permits only "
+                        f"{sorted(self._residency_floor)}. A binding may narrow the "
+                        f"deployment's regions and may not reach outside them."
+                    ),
+                )
+            )
+        return permitted
 
     def call(
         self,

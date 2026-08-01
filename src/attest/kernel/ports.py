@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     from attest.kernel.attestation import Attestation
@@ -48,6 +48,8 @@ __all__ = [
     "SETTLED_STATES",
     "ApprovalStore",
     "AuditSink",
+    "AutonomyMode",
+    "AutonomyStore",
     "BudgetStore",
     "Clock",
     "IdGenerator",
@@ -208,6 +210,58 @@ class Signer(Protocol):
     def sign(self, payload: bytes) -> str: ...
 
     def verify(self, payload: bytes, signature: str) -> bool: ...
+
+
+class AutonomyMode:
+    """How much a capability may do without a human. Mirrors the stored vocabulary."""
+
+    AUTO = "auto"
+    APPROVE = "approve"
+    BLOCKED = "blocked"
+
+    ALL = (AUTO, APPROVE, BLOCKED)
+
+
+@runtime_checkable
+class AutonomyStore(Protocol):
+    """Where the kill switch lives.
+
+    A row rather than a deploy, because a control you can only exercise by shipping
+    code is not a control you can exercise during an incident.
+
+    **Here rather than in ``runtime.operations`` for two reasons.** It is a storage port
+    like every other one, and `docs/kernel/ports.md` already listed it in the port table
+    under a name — ``PolicyStore`` — that existed nowhere in the code. And
+    ``scripts/check_reachability.py`` derives its control list from the Protocols in
+    *this file*, so a port declared elsewhere is a control the gate cannot see. Both
+    halves of that mattered: the switch was written, audited, and read by nothing on any
+    execution path, and the gate written to catch exactly that class of defect passed.
+
+    **Contract:** ``set_mode`` is durable before it returns. A kill switch that is
+    eventually consistent is a kill switch that is off during the window that matters.
+    """
+
+    def set_mode(
+        self, *, tenant: TenantId, capability: str, mode: str, enabled: bool, by: str
+    ) -> None: ...
+
+    def modes(self, *, tenant: TenantId | None = None) -> Sequence[Mapping[str, object]]: ...
+
+    def mode_for(self, *, tenant: TenantId, capability: str) -> str:
+        """The mode in force for one capability. One of :class:`AutonomyMode`.
+
+        Separate from :meth:`modes` because the run path asks about a single capability
+        and must not pay for, or filter, every row in the deployment.
+
+        **What absence means is the store's to decide, and it should decide BLOCKED.**
+        The shipped Django store does: "a capability nobody has classified must not run
+        unattended because a row was missing - an absent policy is an unanswered
+        question, not permission." That is why an engine given no store at all is
+        unaffected while an engine given one is opting into deny-by-default: the choice
+        is made by wiring the store, which is visible, rather than by a default nobody
+        reads.
+        """
+        ...
 
 
 # ── Authority ────────────────────────────────────────────────────────────────────

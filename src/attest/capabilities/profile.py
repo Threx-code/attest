@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from attest.kernel.config import AssuranceTier
 from attest.kernel.errors import ConfigurationError
@@ -219,13 +219,6 @@ class ProfileComposer:
             MappingProxyType({}) if resolvers is None else MappingProxyType(dict(resolvers))
         )
 
-    _ORDER: ClassVar[Mapping[WarrantPolicy, int]] = {
-        WarrantPolicy.RECORD: 0,
-        WarrantPolicy.WARN: 1,
-        WarrantPolicy.HOLD: 2,
-        WarrantPolicy.BLOCK: 3,
-    }
-
     def compose(self, *profiles: DomainProfile) -> tuple[DomainProfile, tuple[PolicyConflict, ...]]:
         """Compose profiles and report every conflict found.
 
@@ -248,13 +241,13 @@ class ProfileComposer:
             opinions = [p.warrant_policy(kind) for p in profiles if kind in p.warrant_kinds()]
             if not opinions:
                 continue
-            strictest = max(opinions, key=lambda p: self._ORDER[p])
+            strictest = WarrantPolicy.strictest(*opinions)
             resolved[kind] = strictest
             if len(set(opinions)) > 1:
                 conflicts.append(
                     PolicyConflict(
                         key=f"warrant_policy:{kind}",
-                        left=min(opinions, key=lambda p: self._ORDER[p]).value,
+                        left=min(opinions, key=lambda p: p.rank).value,
                         right=strictest.value,
                         classification=ConflictClass.STRICTER,
                         detail="scalar ordering exists; the stricter policy was taken",

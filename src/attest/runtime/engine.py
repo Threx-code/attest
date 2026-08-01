@@ -70,6 +70,7 @@ from attest.kernel.context import ExecutionContext, IdentitySnapshot
 from attest.kernel.effects import WORLD_REACHING_EFFECT_STATES, EffectState
 from attest.kernel.errors import ConfigurationError
 from attest.kernel.identifiers import GrantId, Nonces, RunId, RunIds
+from attest.kernel.ports import AutonomyMode
 from attest.kernel.verdicts import Refusal, RefusalReason, Verdict
 from attest.kernel.warrants import (
     NON_DOWNGRADEABLE,
@@ -99,6 +100,7 @@ if TYPE_CHECKING:
     from attest.kernel.ports import (
         ApprovalStore,
         AuditSink,
+        AutonomyStore,
         BudgetStore,
         Clock,
         IdempotencyStore,
@@ -110,6 +112,7 @@ if TYPE_CHECKING:
         Signer,
     )
     from attest.kernel.warrants import WarrantKind
+    from attest.runtime.agents import AgentSpec
 
 __all__ = ["RunEngine", "RunRequest", "RunResult", "VerdictResolver"]
 
@@ -190,6 +193,21 @@ class RunRequest:
     prompt_hashes: Mapping[str, str] = field(default_factory=dict)
     idempotency_key: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    agent: AgentSpec | None = None
+    """The agent this run is proposing as, where one exists.
+
+    Absent, an ``AgentSpec`` could not influence a run at all: the engine never received
+    one, so ``warrant_overrides`` and ``evidence_required`` were fields a caller filled
+    in that were carried, serialised and consulted by nothing. The direction of the harm
+    is what makes it worth a field here rather than a note - an agent declaring itself
+    STRICTER than its deployment silently got the deployment's looser setting, and from
+    the caller's side that is indistinguishable from a setting that was already the
+    default.
+
+    ``None`` for a rules engine, a scheduled job or a human proposing through the same
+    shape, which is the ordinary case and stays exactly as it was.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +462,7 @@ class RunEngine:
         "_approvals",
         "_audit",
         "_authority",
+        "_autonomy",
         "_binder",
         "_boundary",
         "_clock",
@@ -478,6 +497,7 @@ class RunEngine:
         retriever: Retriever | None = None,
         budget: BudgetStore | None = None,
         approvals: ApprovalStore | None = None,
+        autonomy: AutonomyStore | None = None,
         seals: SealRegistry | None = None,
         approval_ttl: timedelta = timedelta(days=7),
         idempotency: IdempotencyStore | None = None,
@@ -510,6 +530,7 @@ class RunEngine:
         self._resolver = resolver or VerdictResolver()
         self._binder = ObligationBinder(budget=budget)
         self._approvals = approvals
+        self._autonomy = autonomy
         self._seals = seals
         self._approval_ttl = approval_ttl
         self._retrieval = (
@@ -653,7 +674,7 @@ class RunEngine:
 
         verdict, refusal = self._resolver.resolve(
             reports=reports,
-            policies={kind: self._profile.warrant_policy(kind) for kind in reports},
+            policies=self._policies_for(request, reports),
             effects=effects,
         )
         if verdict is Verdict.HOLD_FOR_APPROVAL:
@@ -1145,6 +1166,19 @@ class RunEngine:
             EventType.TOOL_PROPOSED.value,
             {"tool": action.tool, "action_hash": str(action.action_hash())},
         )
+        disabled = self._disabled(action)
+        if disabled is not None:
+            recorder.record(
+                EventType.OBLIGATION_FAILED.value,
+                {"obligation": "autonomy", "detail": disabled},
+            )
+            reports[WarrantKinds.AUTHORITY] = self._unevaluatable(
+                WarrantKinds.AUTHORITY, "capability_disabled", disabled
+            )
+            return (
+                EffectRecord(action=action, state=EffectState.PROPOSED, detail=disabled),
+            ), reports
+
         misbinding = self._misbound(action, context)
         if misbinding is not None:
             # Caught here so the run still produces an attestation. The authority
@@ -1208,11 +1242,12 @@ class RunEngine:
 
         # Every blocking warrant must hold before authority is issued. Granting first
         # and checking after would authorise an action the evidence does not support.
+        policies = self._policies_for(request, reports)
         unsatisfied = [
             kind
             for kind, report in reports.items()
             if kind != WarrantKinds.AUTHORITY
-            and self._profile.warrant_policy(kind) is WarrantPolicy.BLOCK
+            and policies.get(kind, WarrantPolicy.BLOCK) is WarrantPolicy.BLOCK
             and not report.is_satisfied()
         ]
         if unsatisfied:
@@ -1314,6 +1349,90 @@ class RunEngine:
             self._binder.commit(bound.reservations, actual=bound.reserved_amount)
             return
         self._binder.release(bound.reservations)
+
+    def _policies_for(
+        self, request: RunRequest, reports: Mapping[WarrantKind, WarrantReport]
+    ) -> dict[WarrantKind, WarrantPolicy]:
+        """The profile's policy per warrant, tightened by the agent's own.
+
+        **An agent may tighten and may not loosen**, which is the rule and the only
+        reason it is safe to let an agent have an opinion here at all. A supervisor that
+        BLOCKs on the boundary warrant while its deployment only WARNs is a deployment
+        choosing to be careful about one agent. The reverse - an agent quietly relaxing
+        a policy its deployment set - is a configuration file granting itself an
+        exemption, and it would be invisible in exactly the way that matters.
+
+        The comparison is :meth:`WarrantPolicy.strictest`, which
+        :class:`~attest.capabilities.profile.ProfileComposer` also uses when composing
+        two profiles. One ordering, so the two cannot drift apart in the permissive
+        direction.
+
+        ``NON_DOWNGRADEABLE`` still sits above all of this in
+        :meth:`VerdictResolver.resolve`: no policy from any source softens a tenancy
+        crossing, and an agent is not a new way in.
+        """
+        base = {kind: self._profile.warrant_policy(kind) for kind in reports}
+        overrides = request.agent.warrant_overrides if request.agent is not None else {}
+        if not overrides:
+            return base
+        return {
+            kind: WarrantPolicy.strictest(policy, overrides.get(kind))
+            for kind, policy in base.items()
+        }
+
+    def _disabled(self, action: Action) -> str | None:
+        """Why this capability may not act right now, or ``None`` if it may.
+
+        The kill switch, read. It was written by ``OperationsConsole.disable`` with a
+        mandatory operator and reason, recorded on the append-only trail before taking
+        effect - and consulted by nothing. An operator flipped it during an incident,
+        the row landed, the audit said who and why, and ``execute`` carried on, because
+        it never asked. A control whose only observable effect is its own audit record
+        is not a control.
+
+        **Only ``BLOCKED`` is handled here, deliberately.** ``APPROVE`` means the
+        capability may act with a human in the loop, and that is exactly what the
+        profile's ``Approval`` obligation already expresses through the authority
+        layer. Implementing it a second time here would put approval policy in two
+        places, and the second one would drift - the same argument
+        :class:`~attest.capabilities.gateway.ModelGateway` makes for leaving budget
+        enforcement to the obligation layer.
+
+        **A store that raises blocks.** Not knowing whether the switch is on is not the
+        same as it being off, and the whole point of this control is the incident during
+        which infrastructure is already unwell. Returning "allowed" on an exception is
+        the ``except Exception:``-then-the-permissive-answer shape that
+        :meth:`~attest.capabilities.evidence.EvidenceEngine.floor_for` documents as the
+        defect class found in every surveyed codebase.
+
+        A run proposing no effect is never blocked here: this switch stops a capability
+        *acting*, and advisory runs act on nothing. A deployment that wants to stop
+        those stops dispatching them.
+
+        **Wiring a store is opting into deny-by-default.** The shipped store answers
+        ``blocked`` for a capability with no row, on the stated ground that an absent
+        policy is an unanswered question rather than permission. That is the right
+        default and it is a real commitment: an engine handed this store refuses every
+        effect until somebody classifies the capability. An engine handed no store is
+        unaffected, which keeps the decision where it can be seen.
+        """
+        if self._autonomy is None:
+            return None
+        capability = action.capability or action.tool
+        try:
+            mode = self._autonomy.mode_for(tenant=action.tenant, capability=capability)
+        except Exception as exc:
+            return (
+                f"the autonomy store could not say whether {capability!r} is enabled "
+                f"({type(exc).__name__}). Refusing: during an incident, not knowing "
+                f"whether the kill switch is on is not the same as it being off."
+            )
+        if mode != AutonomyMode.BLOCKED:
+            return None
+        return (
+            f"capability {capability!r} is disabled for tenant {action.tenant!r}. An "
+            f"operator stopped it; it is not a failure of this run."
+        )
 
     def _misbound(self, action: Action, context: ExecutionContext) -> str | None:
         """Whether the action acts for someone other than the run it arrived in.
@@ -1442,9 +1561,14 @@ class RunEngine:
             reports[WarrantKinds.PROVENANCE] = self._sealer.evaluate(sealed_events, seal=seal)
             # The verdict is re-resolved because provenance may have changed it, and a
             # verdict that ignored its own record's integrity would be worthless.
+            # `_policies_for`, not the profile. The verdict is re-resolved here after
+            # sealing, and reading the profile directly threw away the agent's own
+            # policy that the first resolve had honoured - so an agent could tighten a
+            # warrant, see it applied, and have the answer silently reverted by the
+            # provenance pass. One resolver, one source of policy.
             verdict, refusal = self._resolver.resolve(
                 reports=reports,
-                policies={kind: self._profile.warrant_policy(kind) for kind in reports},
+                policies=self._policies_for(request, reports),
                 effects=effects,
             )
             draft = replace(draft, verdict=verdict, refusal=refusal, warrants=reports)

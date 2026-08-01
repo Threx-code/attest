@@ -184,8 +184,18 @@ class AgentSpec:
     model_tier: ModelTier = ModelTier.BALANCED
     tools: tuple[str, ...] = ()
     max_steps: int = 8
-    evidence_required: bool = True
     warrant_overrides: dict[WarrantKind, WarrantPolicy] = field(default_factory=dict)
+    """Warrant policies this agent holds itself to. **Tightening only.**
+
+    Resolved against the profile's in :meth:`~attest.runtime.engine.RunEngine.
+    _policies_for` by :meth:`~attest.kernel.warrants.WarrantPolicy.strictest`, so an
+    agent may be more careful than its deployment and may not be less. The reverse is a
+    configuration file granting itself an exemption.
+
+    Read by nothing until the engine was given the agent. A caller could fill this in,
+    watch it be carried and serialised, and get the profile's policy - which from the
+    caller's side is indistinguishable from an override that matched the default.
+    """
     scope: Scope = field(default_factory=Scope)
     stream: StreamPolicy = StreamPolicy.FORBIDDEN
     delegates_to: tuple[str, ...] = ()
@@ -206,6 +216,22 @@ class AgentSpec:
                 f"not permit. Delegation is closed by default: an agent that has not "
                 f"declared who it may call may not call anyone."
             )
+
+    def completion_floor(self) -> str:
+        """The weakest model this agent may be served by, as
+        :attr:`~attest.capabilities.gateway.CompletionRequest.min_tier` wants it.
+
+        The two ideas were unconnected: an agent declared ``model_tier`` and the gateway
+        enforced ``min_tier``, and nothing turned one into the other - so an agent
+        declaring a frontier tier could be served, on failover, by whatever cleared
+        residency and features. Feature parity is not quality parity, and a down-tiered
+        answer is structurally identical to a good one.
+
+        A method rather than the gateway reading ``AgentSpec`` directly, because the
+        gateway must not learn what an agent is. It compares positions in a list the
+        deployment supplied, and this hands it a label for that list.
+        """
+        return self.model_tier.value
 
     def effective_scope(self) -> Scope:
         """The scope to hand :meth:`DelegationChain.register_scope`. **Not ``self.scope``.**

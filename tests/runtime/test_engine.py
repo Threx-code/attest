@@ -23,6 +23,7 @@ from attest.capabilities.profile import BaseProfile, GenericProfile
 from attest.kernel.actions import Action
 from attest.kernel.audit import ChainVerifier, EventType
 from attest.kernel.codec import AttestationCodec
+from attest.kernel.config import ModelTier
 from attest.kernel.context import ProfileRef, TenantBinding
 from attest.kernel.effects import EffectClasses, EffectSemantics, EffectState, IdempotencyMode
 from attest.kernel.errors import ConfigurationError
@@ -41,11 +42,15 @@ from attest.kernel.identifiers import (
     RunIds,
     TenantId,
 )
+from attest.kernel.ports import AutonomyMode
 from attest.kernel.verdicts import Verdict
 from attest.kernel.warrants import CORE_WARRANTS, WarrantKinds, WarrantPolicy
+from attest.runtime.agents import AgentSpec
 from attest.runtime.engine import RunEngine, RunRequest
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from attest.kernel.context import ExecutionContext
 
 pytestmark = pytest.mark.integration
@@ -1066,3 +1071,226 @@ def test_an_unmatched_token_fails_the_run_rather_than_shipping() -> None:
     vault.redact("John Smith", "NAME")
     with pytest.raises(ValueError, match="unrestored redaction token"):
         vault.restore("the answer mentions [OTHER_9]")
+
+
+# ── The kill switch, read ────────────────────────────────────────────────────
+#
+# `OperationsConsole.disable` wrote a BLOCKED row with a mandatory operator and reason,
+# on the append-only trail, before the change took effect - and nothing on any execution
+# path consulted it. An operator flipped it during an incident, the audit recorded who
+# and why, and `execute` carried on. A control whose only observable effect is its own
+# audit record is not a control.
+
+
+class Autonomy:
+    """An autonomy store with a stated answer. Absence is BLOCKED, as the shipped one is."""
+
+    def __init__(self, modes: dict[str, str] | None = None, *, raises: Exception | None = None):
+        self._modes = modes or {}
+        self._raises = raises
+        self.asked: list[str] = []
+
+    def set_mode(self, **_: object) -> None: ...
+
+    def modes(self, **_: object) -> tuple[Mapping[str, object], ...]:
+        return ()
+
+    def mode_for(self, *, tenant: TenantId, capability: str) -> str:
+        self.asked.append(capability)
+        if self._raises is not None:
+            raise self._raises
+        return self._modes.get(capability, AutonomyMode.BLOCKED)
+
+
+def test_a_disabled_capability_never_reaches_the_executor() -> None:
+    """The defect, stated as the outcome."""
+    executor = RecordingExecutor()
+    store = Autonomy({"transfer": AutonomyMode.BLOCKED})
+
+    result = engine(autonomy=store).execute(
+        advisory(action=transfer()), binding=binding(), executor=executor
+    )
+
+    assert store.asked == ["transfer"], "the switch was never consulted"
+    assert executor.calls == [], "a disabled capability executed anyway"
+    assert result.verdict is Verdict.REFUSE
+    assert result.attestation.effects[0].state is EffectState.PROPOSED
+
+
+def test_a_disabled_capability_still_produces_an_attestation() -> None:
+    """A refusal the system can record, not an exception that discards the run. The
+    reviewer asking why nothing happened needs the answer in the chain."""
+    result = engine(autonomy=Autonomy()).execute(
+        advisory(action=transfer()), binding=binding(), executor=RecordingExecutor()
+    )
+
+    assert result.attestation.seal is not None
+    assert "disabled" in result.attestation.effects[0].detail
+
+
+def test_an_enabled_capability_runs_normally() -> None:
+    executor = RecordingExecutor()
+
+    result = engine(autonomy=Autonomy({"transfer": AutonomyMode.AUTO})).execute(
+        advisory(action=transfer()), binding=binding(), executor=executor
+    )
+
+    assert executor.calls, "an enabled capability must still execute"
+    assert result.attestation.effects[0].state is EffectState.COMMITTED
+
+
+def test_approve_is_left_to_the_obligation_layer() -> None:
+    """Deliberately not handled here. `APPROVE` means the capability may act with a human
+    in the loop, which the profile's Approval obligation already expresses. Implementing it
+    twice would put approval policy in two places and the second one would drift."""
+    executor = RecordingExecutor()
+
+    engine(autonomy=Autonomy({"transfer": AutonomyMode.APPROVE})).execute(
+        advisory(action=transfer()), binding=binding(), executor=executor
+    )
+
+    assert executor.calls, "APPROVE is not this check's business"
+
+
+def test_a_store_that_cannot_answer_blocks() -> None:
+    """Not knowing whether the switch is on is not the same as it being off, and the whole
+    point of this control is the incident during which infrastructure is already unwell."""
+    executor = RecordingExecutor()
+
+    result = engine(autonomy=Autonomy(raises=RuntimeError("connection refused"))).execute(
+        advisory(action=transfer()), binding=binding(), executor=executor
+    )
+
+    assert executor.calls == [], "an unreachable kill switch was read as 'off'"
+    assert result.verdict is Verdict.REFUSE
+
+
+def test_an_engine_with_no_autonomy_store_is_unaffected() -> None:
+    """The no-adoption path. Wiring the store is what opts a deployment into
+    deny-by-default; not wiring it must change nothing."""
+    executor = RecordingExecutor()
+
+    engine().execute(advisory(action=transfer()), binding=binding(), executor=executor)
+
+    assert executor.calls
+
+
+def test_an_advisory_run_is_not_gated_by_the_switch() -> None:
+    """This switch stops a capability ACTING. An advisory run acts on nothing, and
+    blocking it would stop a deployment reading its own data during an incident."""
+    store = Autonomy()
+
+    result = engine(autonomy=store).execute(advisory(), binding=binding())
+
+    assert store.asked == []
+    assert result.verdict in (Verdict.ALLOW, Verdict.ALLOW_WITH_WARNINGS)
+
+
+def test_the_capability_name_is_preferred_over_the_tool_name() -> None:
+    """One capability may be several tools. Keying the switch on the tool would make an
+    operator disable them one at a time and miss one."""
+    store = Autonomy({"transfer": AutonomyMode.AUTO})
+
+    engine(autonomy=store).execute(
+        advisory(action=transfer()), binding=binding(), executor=RecordingExecutor()
+    )
+
+    assert store.asked == ["transfer"], "it keyed on the tool rather than the capability"
+
+
+# ── An agent may tighten, and may not loosen ─────────────────────────────────
+#
+# `RunRequest` carried no agent, so `AgentSpec` could not influence a run at all:
+# `warrant_overrides` and `evidence_required` were fields a caller filled in that were
+# carried and consulted by nothing. The direction of the harm is what makes it a defect
+# rather than an omission - an agent declaring itself STRICTER than its deployment
+# silently got the deployment's looser setting, and from the caller's side that is
+# indistinguishable from a setting that was already the default.
+
+
+def spec(**overrides: object) -> AgentSpec:
+    fields: dict[str, object] = {
+        "name": "adjudicator",
+        "version": "1.0.0",
+        "prompt": "decide the claim",
+    }
+    fields.update(overrides)
+    return AgentSpec(**fields)  # type: ignore[arg-type]
+
+
+def test_an_agent_may_block_where_its_deployment_only_warns() -> None:
+    """The property, stated as the outcome: the agent's stricter policy is honoured."""
+    strict = spec(warrant_overrides={WarrantKinds.COMPLETENESS: WarrantPolicy.BLOCK})
+
+    result = engine(CoverageProfile()).execute(
+        advisory(coverage=None, agent=strict), binding=binding("coverage")
+    )
+
+    assert result.verdict is Verdict.REFUSE
+
+
+def test_the_same_run_without_the_agent_only_warns() -> None:
+    """The control for the test above. Without it that assertion proves nothing."""
+    result = engine(CoverageProfile()).execute(advisory(coverage=None), binding=binding("coverage"))
+
+    assert result.verdict is Verdict.ALLOW_WITH_WARNINGS
+
+
+def test_an_agent_cannot_loosen_its_deployments_policy() -> None:
+    """The direction that matters. A configuration file granting itself an exemption
+    would be invisible in exactly the way this whole layer exists to prevent."""
+    lax = spec(warrant_overrides={WarrantKinds.COMPLETENESS: WarrantPolicy.RECORD})
+
+    result = engine(BlockingProfile()).execute(
+        advisory(action=transfer(), coverage=None, agent=lax),
+        binding=binding(),
+        executor=RecordingExecutor(),
+    )
+
+    assert result.verdict is Verdict.REFUSE, "an agent talked its way past a blocking profile"
+
+
+def test_citing_nothing_fails_without_any_agent_saying_so() -> None:
+    """Why `AgentSpec.evidence_required` was deleted rather than wired.
+
+    It read as a control and could never be one: EPISTEMIC is in `CORE_WARRANTS`, so
+    every profile already evaluates it, and `EvidenceEngine.evaluate` already fails an
+    empty set with `no_evidence`. `True` could add nothing and `False` must not remove
+    anything, which leaves a field whose only possible effect was to mislead whoever
+    set it. An agent that wants to be *stricter* about evidence uses
+    `warrant_overrides`; a deployment that wants to be looser is the profile's call.
+    """
+    result = engine().execute(advisory(evidence=(), agent=spec()), binding=binding())
+
+    report = result.attestation.warrants[WarrantKinds.EPISTEMIC]
+    assert not report.satisfied
+    assert [f.code for f in report.findings] == ["no_evidence"]
+
+
+def test_a_run_with_no_agent_behaves_exactly_as_before() -> None:
+    """The no-adoption path. A rules engine, a scheduled job and a human propose through
+    this same shape and must be untouched."""
+    result = engine().execute(advisory(), binding=binding())
+
+    assert result.verdict in (Verdict.ALLOW, Verdict.ALLOW_WITH_WARNINGS)
+
+
+def test_an_agent_cannot_soften_a_non_downgradeable_finding() -> None:
+    """`NON_DOWNGRADEABLE` sits above every policy from every source, and an agent is not
+    a new way in. A tenancy crossing is not a thing anyone gets to set to RECORD."""
+    lax = spec(warrant_overrides={WarrantKinds.BOUNDARY: WarrantPolicy.RECORD})
+
+    result = engine().execute(
+        advisory(action=transfer(tenant=TenantId("other")), agent=lax),
+        binding=binding(),
+        executor=RecordingExecutor(),
+    )
+
+    assert result.verdict is Verdict.REFUSE
+
+
+def test_the_completion_floor_is_the_tier_the_gateway_understands() -> None:
+    """The two ideas were unconnected: an agent declared `model_tier`, the gateway
+    enforced `min_tier`, and nothing turned one into the other - so a frontier-tier agent
+    could be served on failover by whatever cleared residency and features."""
+    assert spec(model_tier=ModelTier.REASONING).completion_floor() == ModelTier.REASONING.value

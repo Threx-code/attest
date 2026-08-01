@@ -71,7 +71,23 @@ class Reachability:
         "assert_permits": "ReplayPlan is driven by the host's replay runner",
         "citable_as_evidence": "a property a host reads when citing recalled memory",
         "issue_receipt": "issued at decision time by the host, before or with the effect",
+        "at": "LeafSource is implemented over the host's storage; the package never indexes it",
+        "prompt": "AgentSpec.prompt is rendered by the host's own template layer",
+        "completion_floor": (
+            "the engine builds no CompletionRequest; the host holds both the AgentSpec "
+            "and the request, and this is the bridge it calls"
+        ),
+        "model_tier": (
+            "read only by completion_floor, which is host-driven for the same reason. "
+            "Named on its own line rather than inheriting that, because a field whose "
+            "only reader is host-driven API is a field the package does nothing with"
+        ),
     }
+
+    def __init__(self) -> None:
+        self._properties: set[str] = set(self.PROPERTIES)
+        """Names that can only be satisfied by a read. Seeded from the hand-list, then
+        grown by :meth:`port_methods` as it meets ``@property`` declarations."""
 
     def sources(self) -> dict[Path, str]:
         return {path: path.read_text() for path in self.ROOT.rglob("*.py")}
@@ -112,20 +128,55 @@ class Reachability:
                     found.add(target.id)
         return found
 
-    def reads(self, sources: dict[Path, str]) -> set[str]:
+    def reads(self, sources: dict[Path, str], *, outside_host_driven: bool = False) -> set[str]:
         """Attribute *accesses*, for the controls that are properties.
 
         Kept separate from :meth:`calls` and consulted only for names in
         :attr:`PROPERTIES`, so a property cannot launder a method into looking invoked.
+
+        ``outside_host_driven`` skips the bodies of methods named in
+        :attr:`HOST_DRIVEN`, and the field check uses it. Without it the check launders
+        in the same way: adding a one-line accessor that nothing calls would make a dead
+        field look live. A field reachable only through host-driven API is host-driven
+        too, and has to say so on its own line rather than inherit it.
+        """
+        found: set[str] = set()
+        for text in sources.values():
+            tree = ast.parse(text)
+            skip: set[int] = set()
+            if outside_host_driven:
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef) and node.name in self.HOST_DRIVEN:
+                        skip.update(id(inner) for inner in ast.walk(node))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and id(node) not in skip:
+                    found.add(node.attr)
+        return found
+
+    def indirect(self, sources: dict[Path, str]) -> set[str]:
+        """Names reached through ``getattr`` or ``hasattr``, where the name is a string.
+
+        Neither scan above can see these: it is not an attribute node, and the call node
+        names ``getattr`` rather than the thing being fetched. `DomainProfile.
+        policy_dimensions` is consulted exactly this way, so without this the gate
+        reported a control that is genuinely wired - and a gate that cries wolf is a
+        gate somebody starts suppressing.
         """
         found: set[str] = set()
         for text in sources.values():
             for node in ast.walk(ast.parse(text)):
-                if isinstance(node, ast.Attribute):
-                    found.add(node.attr)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"getattr", "hasattr"}
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                ):
+                    found.add(node.args[1].value)
         return found
 
-    def port_methods(self) -> dict[str, str]:
+    def port_methods(self, sources: dict[Path, str]) -> dict[str, str]:
         """Every method on every port Protocol. **Derived, not hand-listed.**
 
         The hand-maintained list is why ATT-56 happened: ``SealRegistry.close`` was
@@ -133,35 +184,104 @@ class Reachability:
         add it. A control the framework declares a *port* for is a control by
         construction, so the list comes from the ports themselves and a new one is
         covered the moment it is declared.
+
+        **Every file, not just ``kernel/ports.py``.** This scanned that one file, and
+        ``AutonomyStore`` — the kill switch — was declared in ``runtime/operations.py``,
+        so its methods were never in the control set. The result is the exact defect
+        this script exists to catch: ``set_mode`` was written by the operations console,
+        recorded on the append-only trail, and read by nothing on any execution path,
+        while this gate passed. ``docs/kernel/ports.md`` even listed the port under a
+        name that appeared nowhere in the code.
+
+        A Protocol is the declaration "this is a seam somebody plugs into", and where
+        the file happens to sit is not part of that claim.
         """
         found: dict[str, str] = {}
-        tree = ast.parse((self.ROOT / "kernel" / "ports.py").read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            if not any(isinstance(base, ast.Name) and base.id == "Protocol" for base in node.bases):
-                continue
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and not item.name.startswith("_"):
-                    found[item.name] = f"{node.name}.{item.name}"
+        for path, text in sorted(sources.items()):
+            for node in ast.walk(ast.parse(text, filename=str(path))):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                if not any(
+                    isinstance(base, ast.Name) and base.id == "Protocol" for base in node.bases
+                ):
+                    continue
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and not item.name.startswith("_"):
+                        if self._is_property(item):
+                            # Derived rather than added to PROPERTIES by hand. A property
+                            # has no Call node, so it can only ever be satisfied by a
+                            # read - and a hand-list of them is the same artefact the
+                            # control list stopped being.
+                            self._properties.add(item.name)
+                        found.setdefault(item.name, f"{node.name}.{item.name}")
+        return found
+
+    @staticmethod
+    def _is_property(item: ast.FunctionDef) -> bool:
+        return any(
+            (isinstance(d, ast.Name) and d.id == "property")
+            or (isinstance(d, ast.Attribute) and d.attr == "property")
+            for d in item.decorator_list
+        )
+
+    #: Dataclasses whose fields cross a layer boundary, and are therefore contracts. A
+    #: field declared here and read nowhere is the same defect as an uncalled control,
+    #: and it is invisible to the call scan below: `warrant_overrides` on `AgentSpec`
+    #: was never an `ast.Call`, so an agent declaring a STRICTER policy than its
+    #: deployment silently got the looser one and this gate had nothing to say.
+    CONTRACT_TYPES: ClassVar[frozenset[str]] = frozenset({"AgentSpec", "RunRequest"})
+
+    def contract_fields(self, sources: dict[Path, str]) -> dict[str, str]:
+        """Every public field on a type in :attr:`CONTRACT_TYPES`.
+
+        Fields, not methods, because the failure mode is different in shape and
+        identical in consequence: a caller fills the field in, the value is carried,
+        serialised, hashed, and never consulted. From the caller's side that is
+        indistinguishable from a setting that had no effect because it was already the
+        default.
+        """
+        found: dict[str, str] = {}
+        for path, text in sorted(sources.items()):
+            for node in ast.walk(ast.parse(text, filename=str(path))):
+                if not isinstance(node, ast.ClassDef) or node.name not in self.CONTRACT_TYPES:
+                    continue
+                for item in node.body:
+                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                        name = item.target.id
+                        if not name.startswith("_"):
+                            found.setdefault(name, f"{node.name}.{name}")
         return found
 
     def report(self) -> list[str]:
         sources = self.sources()
-        called = self.calls(sources)
+        called = self.calls(sources) | self.indirect(sources)
         read = self.reads(sources)
         problems: list[str] = []
-        controls = {**self.port_methods(), **self.CONTROLS}
-        for name, what in controls.items():
+        ports = self.port_methods(sources)
+        for name, what in {**ports, **self.CONTROLS}.items():
             if name in self.HOST_DRIVEN:
-                problems.append(f"{name}: listed as both a control and host-driven; pick one")
+                # A hand-listed control that is also declared host-driven is a
+                # contradiction somebody should resolve. A *derived* port method that is
+                # declared host-driven is the escape hatch working as intended - the
+                # whole point of HOST_DRIVEN is that it costs a line with a reason.
+                if name in self.CONTROLS:
+                    problems.append(f"{name}: listed as both a control and host-driven; pick one")
                 continue
-            reached = called if name not in self.PROPERTIES else called | read
+            reached = called if name not in self._properties else called | read
             if name not in reached:
                 problems.append(
                     f"{name} enforces {what} and nothing in src/ calls it. Wire it, "
                     f"delete it, or declare it host-driven with a reason."
                 )
+        driven = self.reads(sources, outside_host_driven=True)
+        for name, what in self.contract_fields(sources).items():
+            if name in self.HOST_DRIVEN or name in called or name in driven:
+                continue
+            problems.append(
+                f"{what} is declared, and every read of it is inside host-driven API. A "
+                f"caller can set it and the package will do nothing with it. Wire it, "
+                f"delete it, or declare it host-driven with a reason."
+            )
         return problems
 
 

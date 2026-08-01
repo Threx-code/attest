@@ -37,7 +37,7 @@ untouched.
    STORAGE
      RunStore          persist and fetch attestations
      AuditSink         append events; MUST be append-only
-     PolicyStore       autonomy policy rows
+     AutonomyStore     autonomy policy rows; the kill switch
      ApprovalStore     pending action lifecycle
      MemoryStore       scoped, erasable recall
 
