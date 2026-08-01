@@ -33,7 +33,7 @@ from attest.kernel.identifiers import Hash
 from attest.kernel.verdicts import Refusal, RefusalReason
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from datetime import datetime
 
     from attest.kernel.context import ExecutionContext
@@ -63,6 +63,8 @@ __all__ = [
     "ResidencyRefused",
     "RetryPolicy",
     "SemanticCache",
+    "StreamInterrupted",
+    "StreamingProvider",
 ]
 
 
@@ -86,6 +88,13 @@ class Feature(StrEnum):
     JSON_MODE = "json_mode"
     VISION = "vision"
     CACHING = "caching"
+    STREAMING = "streaming"
+    """Tokens as they are generated, rather than one response at the end.
+
+    A feature rather than a second provider list, so a streamed call is filtered by the
+    same rule as every other one: a backend that cannot stream is dropped from the
+    failover chain for a streamed request, and an empty chain refuses.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +122,8 @@ class ProviderSpec:
     supports_json: bool = True
     supports_vision: bool = False
     supports_caching: bool = False
-    """Both default to ``False``: an undeclared capability is absent, so a provider
+    supports_streaming: bool = False
+    """All three default to ``False``: an undeclared capability is absent, so a provider
     that forgot to describe itself is filtered out rather than asked to do something
     it cannot."""
 
@@ -123,6 +133,7 @@ class ProviderSpec:
             Feature.JSON_MODE: self.supports_json,
             Feature.VISION: self.supports_vision,
             Feature.CACHING: self.supports_caching,
+            Feature.STREAMING: self.supports_streaming,
         }[feature]
 
 
@@ -228,6 +239,32 @@ class LLMProvider(Protocol):
         ...
 
 
+@runtime_checkable
+class StreamingProvider(Protocol):
+    """A backend that can emit tokens as they are generated.
+
+    Separate from :class:`LLMProvider` rather than a method on it, because most backends
+    do not stream and a Protocol that demanded it would exclude them from the
+    ``isinstance`` checks they currently pass.
+
+    The final :class:`CompletionResponse` is the generator's **return value**, not a
+    yielded item. It carries the token counts, and the counts are the only way the call
+    can be priced - a stream reporting nothing but text would be a model call the cost
+    record could not see.
+    """
+
+    @property
+    def spec(self) -> ProviderSpec: ...
+
+    def complete(self, request: CompletionRequest) -> CompletionResponse: ...
+
+    def supports(self, feature: Feature) -> bool: ...
+
+    def stream(self, request: CompletionRequest) -> Generator[str, None, CompletionResponse]:
+        """Yield text chunks, then return the completed response."""
+        ...
+
+
 class ResidencyRefused(Exception):
     """No permitted provider remains within the tenant's residency boundary.
 
@@ -238,6 +275,20 @@ class ResidencyRefused(Exception):
     def __init__(self, refusal: Refusal) -> None:
         super().__init__(refusal.detail)
         self.refusal = refusal
+
+
+class StreamInterrupted(Exception):
+    """A stream failed after the reader had already seen part of it.
+
+    Not a failover. Once bytes have left, switching provider means the reader is shown
+    the answer a second time, which is worse than a truncation they can see. The partial
+    text is carried so a caller can hand it to whatever it was filling.
+    """
+
+    def __init__(self, refusal: Refusal, *, partial: str) -> None:
+        super().__init__(refusal.detail)
+        self.refusal = refusal
+        self.partial = partial
 
 
 class ProviderRouter:
@@ -442,6 +493,16 @@ class ModelCallLog:
     that is not visible from the calls that succeeded.
     """
 
+    streams_abandoned: tuple[str, ...] = ()
+    """Providers whose stream the reader walked away from mid-generation.
+
+    Recorded as a distinct fact rather than as a zero-cost :class:`ModelCall`, because
+    a zero would be false: the provider generated tokens and billed for them, and the
+    consumer disconnected before learning how many. That is the same shape as an
+    upstream timeout after a commit, which this framework types as ``UNKNOWN`` rather
+    than coercing to a number - see :meth:`complete`.
+    """
+
     def cost(self) -> CostRecord:
         """The run's total, summed from what was actually charged."""
         return CostRecord(
@@ -452,6 +513,16 @@ class ModelCallLog:
             amount=str(sum((Decimal(call.amount) for call in self.calls), Decimal(0))),
             pricing_version=self.pricing_version,
         )
+
+    def complete(self) -> bool:
+        """Whether :meth:`cost` is the whole bill.
+
+        ``False`` once a stream was abandoned: the tokens it generated are in no call
+        here and cannot be, so the total under-reports by an amount nobody in this
+        process knows. Anything reconciling against a provider invoice needs telling,
+        rather than inferring completeness from a figure that looks complete.
+        """
+        return not self.streams_abandoned
 
     def model_ref(self) -> ModelRef | None:
         """The model that produced the run's output — the last one to answer.
@@ -781,13 +852,14 @@ class ModelSession:
     :meth:`log`.
     """
 
-    __slots__ = ("_calls", "_circuits", "_context", "_gateway")
+    __slots__ = ("_abandoned", "_calls", "_circuits", "_context", "_gateway")
 
     def __init__(self, gateway: ModelGateway, context: ExecutionContext) -> None:
         self._gateway = gateway
         self._context = context
         self._calls: list[ModelCall] = []
         self._circuits: list[str] = []
+        self._abandoned: list[str] = []
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
         """One governed model call. Residency is filtered before any provider is asked."""
@@ -796,6 +868,27 @@ class ModelSession:
         )
         self._calls.append(call)
         return response
+
+    def stream(self, request: CompletionRequest) -> Generator[str, None, None]:
+        """One governed streamed call, under the same rules as :meth:`complete`.
+
+        Iterate it to read the tokens. The :class:`ModelCall` lands in this session's log
+        when generation finishes, so a streamed run accounts for itself exactly as a
+        completed one does - which is the point. A call site that had to stream was a
+        call site that escaped the gateway, and cost, residency and failover went back to
+        being things each one remembered separately.
+
+        A ``Generator`` rather than an ``Iterator`` because ``close()`` is part of the
+        contract: a reader that disconnects closes this, and closing it is what records
+        the abandonment on :meth:`log`.
+        """
+        call = yield from self._gateway.stream(
+            request,
+            context=self._context,
+            on_circuit_open=self._circuits.append,
+            on_abandoned=self._abandoned.append,
+        )
+        self._calls.append(call)
 
     def log(self) -> ModelCallLog:
         """What this run actually spent, bound to the run that spent it."""
@@ -806,6 +899,7 @@ class ModelSession:
             currency=self._gateway.pricing.currency,
             calls=tuple(self._calls),
             circuits_opened=tuple(dict.fromkeys(self._circuits)),
+            streams_abandoned=tuple(dict.fromkeys(self._abandoned)),
         )
 
 
@@ -852,6 +946,7 @@ class ModelGateway:
         "_semantic",
         "_sleep",
         "_tier_order",
+        "_total_deadline",
         "pricing",
     )
 
@@ -868,6 +963,7 @@ class ModelGateway:
         sleep: Callable[[float], None] | None = None,
         jitter: Callable[[], float] | None = None,
         tier_order: Sequence[str] = (),
+        total_deadline: timedelta | None = None,
     ) -> None:
         """Assemble the gateway.
 
@@ -894,6 +990,7 @@ class ModelGateway:
         self._sleep = sleep if sleep is not None else time.sleep
         self._jitter = jitter if jitter is not None else self._default_jitter
         self._tier_order = tuple(tier_order)
+        self._total_deadline = total_deadline
 
     @staticmethod
     def _new_idempotency_key() -> str:
@@ -911,6 +1008,70 @@ class ModelGateway:
         """
         value: float = random.random()  # noqa: S311 # nosec B311
         return value
+
+    @staticmethod
+    def _returned(provider: LLMProvider, stop: StopIteration) -> CompletionResponse:
+        """The response a provider's stream returned, or a refusal to guess at one.
+
+        A generator that yields text and returns nothing is a model call with no token
+        counts, and a call with no token counts cannot be priced. The alternative is a
+        zero in the cost record, which this package refuses for the same reason
+        :meth:`PricingTable.price` refuses it: a zero meaning free and a zero meaning
+        "we never found out" read identically once written.
+        """
+        response = stop.value
+        if not isinstance(response, CompletionResponse):
+            raise ConfigurationError(
+                f"provider {provider.spec.name!r} streamed but its generator returned "
+                f"{type(response).__name__} rather than a CompletionResponse. The return "
+                f"value carries the token counts, and without them the call cannot be "
+                f"priced."
+            )
+        return response
+
+    def _deadline_from(self, started: datetime) -> datetime | None:
+        """When this chain must give up, or ``None`` where the deployment set no budget."""
+        return None if self._total_deadline is None else started + self._total_deadline
+
+    def _expired(self, deadline: datetime | None) -> bool:
+        return deadline is not None and self._clock.now() >= deadline
+
+    def _chain_exhausted(
+        self,
+        context: ExecutionContext,
+        failures: Sequence[str],
+        *,
+        out_of_time: bool,
+    ) -> ResidencyRefused:
+        """The refusal at the end of the chain, saying which way it ended.
+
+        Two different remedies. "Every provider failed" sends an operator to look at
+        routing; "the budget ran out" means the routing was fine and the budget was the
+        constraint, and reporting the second as the first has somebody debugging a
+        healthy provider list.
+        """
+        regions = sorted(context.binding.residency_regions) or "unconstrained"
+        if out_of_time:
+            return ResidencyRefused(
+                Refusal(
+                    reason=RefusalReason("deadline_exceeded"),
+                    detail=(
+                        f"the failover chain exceeded its {self._total_deadline} budget "
+                        f"before any provider answered: {'; '.join(failures)}. Refusing "
+                        f"rather than holding the caller for the sum of every timeout."
+                    ),
+                )
+            )
+        return ResidencyRefused(
+            Refusal(
+                reason=RefusalReason("evidence_source_unreachable"),
+                detail=(
+                    f"every provider permitted within residency {regions} failed: "
+                    f"{'; '.join(failures)}. Refusing rather than failing over out of "
+                    f"region."
+                ),
+            )
+        )
 
     def session(self, context: ExecutionContext) -> ModelSession:
         """A gateway scoped to one run, accumulating what it spends."""
@@ -959,14 +1120,23 @@ class ModelGateway:
         request = replace(request, idempotency_key=self._new_idempotency_key())
 
         now = self._clock.now()
+        deadline = self._deadline_from(now)
         attempted: list[str] = []
         failures: list[str] = []
         for index, provider in enumerate(candidates):
+            if self._expired(deadline):
+                failures.append("deadline exceeded before the chain was exhausted")
+                break
             if not self._breaker.allows(provider.spec.name, now=now):
                 failures.append(f"{provider.spec.name}: circuit open")
                 continue
             response = self._attempt(
-                provider, request, failures, now=now, on_circuit_open=on_circuit_open
+                provider,
+                request,
+                failures,
+                now=now,
+                deadline=deadline,
+                on_circuit_open=on_circuit_open,
             )
             if response is None:
                 attempted.append(provider.spec.name)
@@ -979,17 +1149,134 @@ class ModelGateway:
             )
             return response, call
 
-        raise ResidencyRefused(
-            Refusal(
-                reason=RefusalReason("evidence_source_unreachable"),
-                detail=(
-                    f"every provider permitted within residency "
-                    f"{sorted(context.binding.residency_regions) or 'unconstrained'} "
-                    f"failed: {'; '.join(failures)}. Refusing rather than failing over "
-                    f"out of region."
-                ),
-            )
+        raise self._chain_exhausted(context, failures, out_of_time=self._expired(deadline))
+
+    def stream(
+        self,
+        request: CompletionRequest,
+        *,
+        context: ExecutionContext,
+        on_circuit_open: Callable[[str], None] | None = None,
+        on_abandoned: Callable[[str], None] | None = None,
+    ) -> Generator[str, None, ModelCall]:
+        """Serve one request as tokens, or refuse. Same rules as :meth:`call`.
+
+        Residency, tier, features, the breaker, the retry policy, the deadline, the
+        idempotency key and the cache all apply exactly as they do to a completion. That
+        is the whole point of the method existing: a call site that could not stream
+        through the gateway streamed around it, and every property above went back to
+        being something that call site remembered on its own.
+
+        **Failover happens only before the first chunk.** Once bytes have reached the
+        reader, moving to another provider means re-emitting from the top, and a reader
+        who watches the answer restart is worse served than one who sees it stop. After
+        the first chunk a failure is a :class:`StreamInterrupted` carrying what was
+        already shown.
+        """
+        eligible = self.router_for(context).select(
+            [provider.spec for provider in self._providers],
+            requires_tools=request.requires_tools,
+            requires=request.requires | {Feature.STREAMING},
+            min_tier=request.min_tier,
         )
+        permitted = {spec.name for spec in eligible}
+        candidates = [p for p in self._providers if p.spec.name in permitted]
+
+        # A cached answer arrives whole. Served as one chunk rather than skipped, so a
+        # streamed call cannot quietly bypass the tenant-partitioned cache that every
+        # completed call goes through.
+        cached = self._from_cache(request, candidates, context=context)
+        if cached is not None:
+            response, call = cached
+            yield response.text
+            return call
+
+        request = replace(request, idempotency_key=self._new_idempotency_key())
+        now = self._clock.now()
+        deadline = self._deadline_from(now)
+        attempted: list[str] = []
+        failures: list[str] = []
+
+        for index, provider in enumerate(candidates):
+            if self._expired(deadline):
+                failures.append("deadline exceeded before the chain was exhausted")
+                break
+            if not self._breaker.allows(provider.spec.name, now=now):
+                failures.append(f"{provider.spec.name}: circuit open")
+                continue
+            if not isinstance(provider, StreamingProvider):
+                # Unreachable while the STREAMING feature filter above holds, and checked
+                # anyway: the filter reads a spec the provider supplied about itself.
+                failures.append(f"{provider.spec.name}: declares streaming but has none")
+                continue
+
+            for attempt in range(1, self._retry.attempts + 1):
+                seen: list[str] = []
+                done: CompletionResponse | None = None
+                source = provider.stream(request)
+                try:
+                    while done is None:
+                        try:
+                            chunk = next(source)
+                        except StopIteration as stop:
+                            done = self._returned(provider, stop)
+                        else:
+                            seen.append(chunk)
+                            yield chunk
+                except GeneratorExit:
+                    # The reader walked away. The provider is still generating and still
+                    # billing, and nobody in this process will learn how much - so it is
+                    # recorded as an abandonment rather than as a zero-cost call.
+                    source.close()
+                    if on_abandoned is not None:
+                        on_abandoned(provider.spec.name)
+                    raise
+                except ConfigurationError:
+                    # A backend wired wrongly is not a backend having a bad minute.
+                    # Failing over would try the next provider, and the next deployment
+                    # that streams would meet the same wiring with the same silence.
+                    source.close()
+                    raise
+                except Exception as exc:  # a provider failure is a failover, not a crash
+                    source.close()
+                    failures.append(f"{provider.spec.name}: {type(exc).__name__}")
+                    if seen:
+                        raise StreamInterrupted(
+                            Refusal(
+                                reason=RefusalReason("stream_interrupted"),
+                                detail=(
+                                    f"{provider.spec.name} failed with "
+                                    f"{type(exc).__name__} after "
+                                    f"{len(seen)} chunks had already been read. Not "
+                                    f"failing over: the reader would see the answer "
+                                    f"begin again."
+                                ),
+                            ),
+                            partial="".join(seen),
+                        ) from exc
+                    if attempt < self._retry.attempts and not self._expired(deadline):
+                        self._sleep(self._retry.delay(attempt, jitter=self._jitter()))
+                        continue
+                    if (
+                        self._breaker.record_failure(provider.spec.name, now=now)
+                        and on_circuit_open is not None
+                    ):
+                        on_circuit_open(provider.spec.name)
+                    break
+
+                self._breaker.record_success(provider.spec.name)
+                self._store(request, done, provider, context=context)
+                return self._price(
+                    done,
+                    provider,
+                    request,
+                    failover=index > 0,
+                    attempted=attempted,
+                    cached=False,
+                )
+            attempted.append(provider.spec.name)
+
+        raise self._chain_exhausted(context, failures, out_of_time=self._expired(deadline))
 
     def _attempt(
         self,
@@ -998,6 +1285,7 @@ class ModelGateway:
         failures: list[str],
         *,
         now: datetime,
+        deadline: datetime | None = None,
         on_circuit_open: Callable[[str], None] | None = None,
     ) -> CompletionResponse | None:
         """Try one provider, retrying it before giving up on it.
@@ -1016,7 +1304,10 @@ class ModelGateway:
                 # attestation — where audit.md forbids credentials "in any form". The
                 # body belongs in the host's logs, at a level that is not chained.
                 failures.append(f"{provider.spec.name}: {type(exc).__name__}")
-                if attempt < self._retry.attempts:
+                # The deadline is checked HERE as well as in `call`, because the sleep is
+                # where the time goes. Backing off past the budget and then discovering it
+                # has passed spends the whole budget on waiting.
+                if attempt < self._retry.attempts and not self._expired(deadline):
                     self._sleep(self._retry.delay(attempt, jitter=self._jitter()))
                     continue
                 if (

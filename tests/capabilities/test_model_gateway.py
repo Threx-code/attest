@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -35,6 +35,7 @@ from attest.capabilities.gateway import (
     ProviderSpec,
     ResidencyRefused,
     RetryPolicy,
+    StreamInterrupted,
 )
 from attest.kernel.context import (
     ExecutionContext,
@@ -44,6 +45,9 @@ from attest.kernel.context import (
 )
 from attest.kernel.errors import ConfigurationError
 from attest.kernel.identifiers import ActorId, Hash, RunId, TenantId
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 pytestmark = pytest.mark.unit
 
@@ -982,3 +986,356 @@ def test_a_caller_supplied_key_is_not_trusted() -> None:
     gateway.session(context()).complete(request())
 
     assert provider.calls[0].idempotency_key
+
+
+# ── The deadline across the chain ────────────────────────────────────────────
+#
+# `RetryPolicy` bounds attempts per provider and the loop walks the candidate list, and
+# nothing bounded the two together. The timeouts multiply: an SDK's own retries, times
+# the retry policy, times every candidate. Survivable on a worker, not survivable on a
+# request thread, and the gateway cannot tell which it is on.
+
+
+class Advancing:
+    """A clock that moves on every reading. Time passing, injected like everything else."""
+
+    def __init__(self, *, step: timedelta = timedelta(seconds=1), at: datetime = AT) -> None:
+        self.at = at
+        self._step = step
+        self.readings = 0
+
+    def now(self) -> datetime:
+        self.readings += 1
+        reading = self.at
+        self.at += self._step
+        return reading
+
+
+def test_the_chain_stops_when_its_budget_is_spent() -> None:
+    """The defect, stated as the outcome: the later providers are never asked."""
+    first = Provider("first", raises=RuntimeError("timeout"))
+    second = Provider("second")
+    gateway = ModelGateway(
+        [first, second],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(seconds=20)),
+        sleep=lambda _: None,
+        total_deadline=timedelta(seconds=30),
+    )
+
+    with pytest.raises(ResidencyRefused):
+        gateway.session(context()).complete(request())
+    assert second.calls == [], "the chain kept walking after its budget was gone"
+
+
+def test_a_spent_budget_is_a_different_refusal_from_an_exhausted_chain() -> None:
+    """The remedies differ. 'Every provider failed' sends an operator to look at routing,
+    and the routing was fine."""
+    gateway = ModelGateway(
+        [Provider("first", raises=RuntimeError("timeout")), Provider("second")],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(seconds=20)),
+        sleep=lambda _: None,
+        total_deadline=timedelta(seconds=30),
+    )
+
+    with pytest.raises(ResidencyRefused) as caught:
+        gateway.session(context()).complete(request())
+    assert caught.value.refusal.reason == "deadline_exceeded"
+
+
+def test_the_backoff_does_not_sleep_past_the_deadline() -> None:
+    """The sleep is where the time goes. Backing off and then finding the budget gone
+    spends the whole budget on waiting."""
+    slept: list[float] = []
+    gateway = ModelGateway(
+        [Provider("only", raises=RuntimeError("timeout"))],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(seconds=20)),
+        retry=RetryPolicy(attempts=4),
+        sleep=slept.append,
+        total_deadline=timedelta(seconds=30),
+    )
+
+    with pytest.raises(ResidencyRefused):
+        gateway.session(context()).complete(request())
+    assert slept == [], "it backed off with no time left to use the result"
+
+
+def test_a_deployment_that_sets_no_deadline_is_unaffected() -> None:
+    """The no-adoption path. `None` must leave behaviour exactly as it was."""
+    first = Provider("first", raises=RuntimeError("timeout"))
+    second = Provider("second")
+    gateway = ModelGateway(
+        [first, second],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(hours=1)),
+        sleep=lambda _: None,
+    )
+
+    assert gateway.session(context()).complete(request()).provider == "second"
+
+
+def test_a_call_inside_its_budget_is_untouched() -> None:
+    """A deadline that fires on a healthy call would be worse than no deadline."""
+    gateway = ModelGateway(
+        [Provider("first", raises=RuntimeError("503")), Provider("second")],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(milliseconds=5)),
+        sleep=lambda _: None,
+        total_deadline=timedelta(seconds=30),
+    )
+
+    assert gateway.session(context()).complete(request()).provider == "second"
+
+
+# ── Streaming ────────────────────────────────────────────────────────────────
+#
+# The gateway could not stream at all, which is not a degradation but an exclusion: a
+# product whose main interaction is a streamed answer keeps its own gateway for that
+# path, and a project that keeps one gateway keeps all of it.
+
+
+class Streaming(Provider):
+    """A provider that emits chunks and then returns the completed response."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        chunks: tuple[str, ...] = ("one ", "two"),
+        fails_after: int | None = None,
+        returns: Any = ...,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(name, **kwargs)
+        self._spec = ProviderSpec(
+            name=self._spec.name,
+            model_id=self._spec.model_id,
+            family=self._spec.family,
+            region=self._spec.region,
+            tier=self._spec.tier,
+            supports_tools=self._spec.supports_tools,
+            supports_vision=self._spec.supports_vision,
+            supports_streaming=True,
+        )
+        self._chunks = chunks
+        self._fails_after = fails_after
+        self._returns = returns
+        self.streamed = 0
+
+    def stream(self, request: CompletionRequest) -> Generator[str, None, CompletionResponse]:
+        self.streamed += 1
+        self.calls.append(request)
+        for index, chunk in enumerate(self._chunks):
+            if self._fails_after is not None and index >= self._fails_after:
+                raise RuntimeError("the connection dropped")
+            yield chunk
+        if self._returns is not ...:
+            return cast("CompletionResponse", self._returns)
+        return CompletionResponse(
+            text="".join(self._chunks),
+            provider=self._spec.name,
+            model_id=self._spec.model_id,
+            family=self._spec.family,
+            input_tokens=1000,
+            output_tokens=500,
+        )
+
+
+def test_a_streamed_call_yields_the_providers_chunks_in_order() -> None:
+    gateway = ModelGateway([Streaming("p")], pricing=pricing(), clock=Clock())
+
+    assert list(gateway.session(context()).stream(request())) == ["one ", "two"]
+
+
+def test_a_provider_that_cannot_stream_is_never_asked_to() -> None:
+    """A backend that did not declare streaming is filtered out by the same rule as one
+    that did not declare tools. An undeclared capability is absent."""
+    plain = Provider("plain")
+    gateway = ModelGateway([plain], pricing=pricing(), clock=Clock())
+
+    with pytest.raises(ResidencyRefused):
+        list(gateway.session(context()).stream(request()))
+    assert plain.calls == []
+
+
+def test_a_streamed_call_is_priced_into_the_run_log() -> None:
+    """A stream that cost nothing on the record is a call site that escaped the gateway."""
+    gateway = ModelGateway([Streaming("p")], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    list(session.stream(request()))
+
+    log = session.log()
+    assert len(log.calls) == 1
+    assert log.cost().amount == "0.017500"
+    assert log.complete()
+
+
+def test_a_stream_will_not_leave_the_residency_boundary() -> None:
+    """Every rule `call` applies, `stream` applies. This is the one that matters most."""
+    outside = Streaming("us", region="us-east-1")
+    inside = Streaming("eu", region="eu-west-2")
+    gateway = ModelGateway([outside, inside], pricing=pricing(), clock=Clock())
+
+    list(gateway.session(context(regions=frozenset({"eu-west-2"}))).stream(request()))
+    assert outside.calls == []
+
+
+def test_a_stream_will_not_fail_over_below_its_tier() -> None:
+    strong = Streaming("strong", tier="drafting", fails_after=0)
+    cheap = Streaming("cheap", tier="fast")
+    gateway = ModelGateway(
+        [strong, cheap],
+        pricing=pricing(),
+        clock=Clock(),
+        tier_order=TIERS,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(ResidencyRefused):
+        list(gateway.session(context()).stream(request(min_tier="drafting")))
+    assert cheap.calls == []
+
+
+def test_a_failure_before_the_first_chunk_fails_over() -> None:
+    """Nothing has been read yet, so another provider can serve it cleanly."""
+    first = Streaming("first", fails_after=0)
+    second = Streaming("second")
+    gateway = ModelGateway([first, second], pricing=pricing(), clock=Clock(), sleep=lambda _: None)
+
+    assert list(gateway.session(context()).stream(request())) == ["one ", "two"]
+    assert second.streamed == 1
+
+
+def test_a_failure_after_the_first_chunk_does_not_fail_over() -> None:
+    """Once bytes have left, a failover means the reader watches the answer start again.
+    A truncation they can see is the better failure."""
+    first = Streaming("first", chunks=("half ", "the rest"), fails_after=1)
+    second = Streaming("second")
+    gateway = ModelGateway([first, second], pricing=pricing(), clock=Clock(), sleep=lambda _: None)
+
+    stream = gateway.session(context()).stream(request())
+    assert next(stream) == "half "
+    with pytest.raises(StreamInterrupted) as caught:
+        next(stream)
+
+    assert caught.value.partial == "half "
+    assert caught.value.refusal.reason == "stream_interrupted"
+    assert second.calls == [], "it re-emitted the answer from a second provider"
+
+
+def test_the_idempotency_key_survives_a_streamed_failover() -> None:
+    """A streamed failover is still the same logical call, and the first provider may
+    already have been billed for the tokens it generated."""
+    first = Streaming("first", fails_after=0)
+    second = Streaming("second")
+    gateway = ModelGateway([first, second], pricing=pricing(), clock=Clock(), sleep=lambda _: None)
+
+    list(gateway.session(context()).stream(request()))
+    assert first.calls[0].idempotency_key == second.calls[0].idempotency_key
+
+
+def test_a_reader_who_walks_away_is_recorded_rather_than_priced_at_zero() -> None:
+    """The provider generated tokens and billed for them, and nobody here learned how
+    many. That is `UNKNOWN`, and this package does not coerce `UNKNOWN` to a number."""
+    gateway = ModelGateway([Streaming("p")], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    stream = session.stream(request())
+    assert next(stream) == "one "
+    stream.close()
+
+    log = session.log()
+    assert log.streams_abandoned == ("p",)
+    assert log.calls == (), "an abandoned stream was priced as though it had finished"
+    assert not log.complete(), "the cost record claimed to be the whole bill"
+
+
+def test_a_cached_answer_is_streamed_rather_than_bypassed() -> None:
+    """Otherwise a streamed call quietly skips the tenant-partitioned cache that every
+    completed call goes through, and the two paths disagree about what a tenant may see."""
+    provider = Streaming("p")
+    gateway = ModelGateway([provider], pricing=pricing(), clock=Clock())
+    session = gateway.session(context())
+
+    session.complete(request())
+    assert list(session.stream(request())) == ["answered"]
+    assert provider.streamed == 0
+
+    assert session.log().calls[-1].served_from_cache
+
+
+def test_a_stream_that_returns_no_response_is_refused_rather_than_priced_at_zero() -> None:
+    """The return value carries the token counts. Without them the call cannot be priced,
+    and a zero meaning free reads exactly like a zero meaning 'we never found out'."""
+    gateway = ModelGateway([Streaming("p", returns=None)], pricing=pricing(), clock=Clock())
+
+    with pytest.raises(ConfigurationError):
+        list(gateway.session(context()).stream(request()))
+
+
+def test_a_stream_stops_when_the_chains_budget_is_spent() -> None:
+    """The deadline is a property of the chain, not of the method that walks it."""
+    first = Streaming("first", fails_after=0)
+    second = Streaming("second")
+    gateway = ModelGateway(
+        [first, second],
+        pricing=pricing(),
+        clock=Advancing(step=timedelta(seconds=20)),
+        sleep=lambda _: None,
+        total_deadline=timedelta(seconds=30),
+    )
+
+    with pytest.raises(ResidencyRefused) as caught:
+        list(gateway.session(context()).stream(request()))
+    assert caught.value.refusal.reason == "deadline_exceeded"
+    assert second.calls == []
+
+
+def test_a_stream_will_not_hammer_a_provider_whose_circuit_is_open() -> None:
+    """The breaker is a property of the provider, not of the method that reaches it."""
+    degraded = Streaming("degraded")
+    healthy = Streaming("healthy")
+    breaker = CircuitBreaker(threshold=1)
+    breaker.record_failure("degraded", now=AT)
+    gateway = ModelGateway([degraded, healthy], pricing=pricing(), clock=Clock(), breaker=breaker)
+
+    assert list(gateway.session(context()).stream(request())) == ["one ", "two"]
+    assert degraded.streamed == 0
+
+
+def test_a_failing_stream_opens_the_circuit_and_says_so() -> None:
+    """A run that streamed while a provider was fast-failing had a smaller pool to route
+    within, and that is not visible from the calls that succeeded."""
+    gateway = ModelGateway(
+        [Streaming("first", fails_after=0), Streaming("second")],
+        pricing=pricing(),
+        clock=Clock(),
+        breaker=CircuitBreaker(threshold=1),
+        sleep=lambda _: None,
+    )
+    session = gateway.session(context())
+
+    list(session.stream(request()))
+    assert session.log().circuits_opened == ("first",)
+
+
+def test_a_provider_whose_spec_claims_streaming_it_lacks_is_skipped() -> None:
+    """The feature filter reads a spec the provider wrote about itself. Believing it and
+    then calling `stream` on something that has none would be an AttributeError sent to a
+    reader, so the chain checks the object as well as its claim."""
+    liar = Provider("liar")
+    liar._spec = ProviderSpec(
+        name="liar",
+        model_id="claude-opus-5",
+        family="claude",
+        region="eu-west-2",
+        supports_streaming=True,
+    )
+    honest = Streaming("honest")
+    gateway = ModelGateway([liar, honest], pricing=pricing(), clock=Clock())
+
+    assert list(gateway.session(context()).stream(request())) == ["one ", "two"]
+    assert liar.calls == []

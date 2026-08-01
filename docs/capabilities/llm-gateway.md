@@ -29,7 +29,11 @@ and therefore inconsistently.
 class LLMProvider(Protocol):
     name: str
     def complete(self, req: CompletionRequest) -> CompletionResponse: ...
-    def supports(self, feature: Feature) -> bool: ...   # tools, json_mode, vision, caching
+    def supports(self, feature: Feature) -> bool: ...   # tools, json_mode, vision, caching, streaming
+
+
+class StreamingProvider(LLMProvider, Protocol):
+    def stream(self, req: CompletionRequest) -> Generator[str, None, CompletionResponse]: ...
 ```
 
 Shipped as optional extras: Anthropic, OpenAI, Bedrock, Azure OpenAI, Vertex, and a
@@ -54,6 +58,52 @@ error.
 Failover crosses providers, which means the response may come from a different model than
 requested. That fact is **recorded in the attestation**, because a decision made by a
 fallback model is a materially different decision, and replay must know.
+
+### One deadline bounds the whole chain
+
+`RetryPolicy` bounds attempts per provider. `total_deadline` bounds the chain, and without
+it the timeouts multiply: an SDK's own retries, times the retry policy, times every
+candidate. A single logical call can then hold a provider for minutes while each layer
+believes it is being patient on its own small budget.
+
+```python
+ModelGateway(providers, pricing=..., clock=..., total_deadline=timedelta(seconds=45))
+```
+
+`None` by default, so a deployment that has not thought about it gets exactly the previous
+behaviour. Checked before each provider and before each backoff sleep - the sleep is where
+the time goes, and backing off only to find the budget spent spends the budget on waiting.
+
+Running out of time is `deadline_exceeded`, not `evidence_source_unreachable`. The remedies
+differ: "every provider failed" sends an operator to look at routing, and the routing was
+fine.
+
+Read from the injected `Clock`, whose contract already requires monotonicity within a run.
+That keeps a deadline reproducible in replay rather than making it the ambient wall-clock
+time this package bans everywhere else.
+
+### Streaming
+
+`ModelGateway.stream()` applies every rule `call()` applies - residency, tier, features, the
+breaker, the retry policy, the deadline, the idempotency key and the cache - and yields
+tokens instead of returning a body. It exists because a call site that cannot stream through
+the gateway streams around it, and then cost, residency and failover go back to being things
+that call site remembers on its own.
+
+Streaming is a `Feature`, so a backend that did not declare `supports_streaming` is filtered
+out of a streamed request the same way one that did not declare tools is, and a chain with
+nothing left refuses.
+
+**Failover happens only before the first chunk.** Once bytes have reached the reader,
+switching provider means re-emitting from the top, and watching the answer start again is
+worse than watching it stop. After the first chunk a failure is `StreamInterrupted`, which
+carries the partial text and a `stream_interrupted` refusal.
+
+A reader that disconnects mid-stream is recorded on `ModelCallLog.streams_abandoned`, not
+priced as a zero-cost call. The provider generated tokens and billed for them and nobody in
+the process learned how many, which is the `UNKNOWN` case this framework refuses to coerce
+to a number - `ModelCallLog.complete()` is then `False`, so anything reconciling against an
+invoice is told the total is short rather than left to assume it is whole.
 
 ## Cost
 
