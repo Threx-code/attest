@@ -275,18 +275,55 @@ class RedactionVault:
         return token
 
     def apply(self, text: str) -> str:
-        """Substitute every registered value, **longest first**.
+        """Substitute every registered value, **longest first** and **case-insensitively**.
 
         Order matters when one value contains another — a surname inside a full name.
         Replacing the shorter first leaves the longer half-tokenised, which reads as
         corruption and restores as neither.
+
+        Case matters because the text is usually not ours. This was ``text.replace(value,
+        token)``, which is case-sensitive, so a party registered as "ABCD Bank Plc" was not
+        masked where the document wrote "abcd bank plc" — and a document drafted by the
+        other side routinely does. The value the caller registered is the one it holds on
+        record; the form in the text is whatever the counterparty typed.
+
+        A form that differs in case gets **its own token**, so restoration puts back what
+        the document actually wrote rather than normalising its capitalisation. A redaction
+        pass that silently retypes a counterparty's name is editing the document.
         """
         result = text
-        for token, value in sorted(
-            self._by_token.items(), key=lambda pair: len(pair[1]), reverse=True
-        ):
-            result = result.replace(value, token)
+        # The `list()` is load-bearing and ruff cannot see why: `_alias` registers a token
+        # for a newly-seen casing, so the dict grows during this loop and iterating it
+        # directly raises. Snapshotting the keys is the fix, not the noise.
+        snapshot = list(self._by_token)
+        for token in sorted(snapshot, key=lambda t: len(self._by_token[t]), reverse=True):
+            value = self._by_token[token]
+            result = re.sub(
+                re.escape(value), self._form_replacer(token, value), result, flags=re.IGNORECASE
+            )
         return result
+
+    def _form_replacer(self, token: str, value: str) -> Callable[[re.Match[str]], str]:
+        def replace(match: re.Match[str]) -> str:
+            form = match.group(0)
+            return token if form == value else self._alias(form, token)
+
+        return replace
+
+    def _alias(self, form: str, token: str) -> str:
+        """A token for a differently-cased occurrence of an already-registered value.
+
+        Reused if this exact form has been seen before, so the same spelling in two places
+        restores identically and the token count reflects distinct forms rather than
+        occurrences.
+        """
+        for existing, held in self._by_token.items():
+            if held == form:
+                return existing
+        label = token.strip("[]").rsplit("_", 1)[0]
+        alias = f"[{label}_{len(self._by_token) + 1}]"
+        self._by_token[alias] = form
+        return alias
 
     def restore(self, text: str) -> str:
         r"""Restore every token. Raises if any remains unmatched.

@@ -233,6 +233,34 @@ def test_a_value_containing_a_backslash_survives_restoration() -> None:
     assert vault.restore(f"stored at {token}") == r"stored at C:\Users\ada"
 
 
+@pytest.mark.security
+def test_a_value_is_masked_whatever_case_the_document_used() -> None:
+    """`apply` was `text.replace(value, token)`, which is case-sensitive.
+
+    The value a caller registers is the one it holds on record; the form in the text is
+    whatever the counterparty typed. A party registered as "ABCD Bank Plc" was not masked
+    where the document wrote "abcd bank plc" - and a document drafted by the other side
+    routinely does. The identity then egressed in full.
+    """
+    vault = RedactionVault()
+    vault.redact("ABCD Bank Plc", "NAME")
+
+    masked = vault.apply("The lender, abcd bank plc, agrees.")
+
+    assert "bank plc" not in masked.lower()
+
+
+@pytest.mark.security
+def test_restoration_puts_back_the_capitalisation_the_document_used() -> None:
+    """Each distinct form gets its own token. A redaction pass that silently retypes a
+    counterparty's name is editing the document."""
+    vault = RedactionVault()
+    vault.redact("ABCD Bank Plc", "NAME")
+    original = "The lender, abcd bank plc, and ABCD Bank Plc agree."
+
+    assert vault.restore(vault.apply(original)) == original
+
+
 def test_the_vault_tracks_how_many_values_it_holds() -> None:
     vault = RedactionVault()
     vault.redact("John Smith", "PERSON")
