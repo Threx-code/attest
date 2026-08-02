@@ -674,7 +674,7 @@ class RunEngine:
             request, binding=binding, run_id=run_id, recorder=recorder, at=at
         )
 
-        reports = dict(self._assess(request, recorder=recorder, at=at))
+        reports = dict(self._assess(request, context=context, recorder=recorder, at=at))
         effects, reports = self._authorise_and_execute(
             request,
             context=context,
@@ -1102,6 +1102,7 @@ class RunEngine:
         self,
         request: RunRequest,
         *,
+        context: ExecutionContext,
         recorder: EventRecorder,
         at: datetime,
     ) -> dict[WarrantKind, WarrantReport]:
@@ -1114,12 +1115,28 @@ class RunEngine:
             # documents are how indirect prompt injection arrives, and they were the
             # one channel never checked — `screen_evidence` is a tenancy comparison.
             tainted = self._guards.screen_evidence_content(request.evidence)
+            # Within-tenant read scoping, over the evidence the CALLER supplied. The
+            # retrieval engine screens what it fetches itself, and a host with its own
+            # retrieval stack - the common case - handed its candidates straight past it.
+            # The scope was carried in the context and hashed into the attestation while
+            # nothing compared anything to it, which is a record asserting a boundary that
+            # never applied: the exact defect this package names in its gateway docstring.
+            barred = self._guards.screen_visibility(request.evidence, visibility=context.visibility)
+            if barred:
+                recorder.record(
+                    EventType.TENANCY_VIOLATION.value,
+                    {
+                        "detail": "evidence outside the actor's visibility scope",
+                        "evidence": sorted(str(e) for e in barred),
+                    },
+                )
             outcome = GuardOutcome(
                 inbound=(
                     *(self._guards.screen_inbound(text) for text in request.inbound_text),
                     *(result for _, result in tainted),
                 ),
                 tenancy=self._guards.screen_evidence(request.evidence, tenant=request.tenant),
+                visibility=barred,
             )
             if any(not screen.clean for screen in outcome.inbound):
                 recorder.record(

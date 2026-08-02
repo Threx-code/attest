@@ -32,6 +32,7 @@ from attest.kernel.warrants import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
+    from attest.kernel.context import VisibilityScope
     from attest.kernel.evidence import Evidence
     from attest.kernel.identifiers import EvidenceId, TenantId
 
@@ -446,6 +447,15 @@ class GuardOutcome:
     inbound: tuple[ScreenResult, ...] = ()
     outbound: tuple[ScreenResult, ...] = ()
     tenancy: ScreenResult | None = None
+    visibility: tuple[EvidenceId, ...] = ()
+    """Evidence the actor may not read INSIDE their tenant - the ethical wall.
+
+    Separate from `tenancy` because they are different failures with different remedies. A
+    cross-tenant read is a leak between customers; a walled read is a conflict inside one
+    firm. Both are unconditional, and reporting the second as the first would send an
+    incident review looking for a tenancy bug that does not exist.
+    """
+
     redactions: int = 0
     restorations: int = 0
     disclosures: tuple[str, ...] = field(default_factory=tuple)
@@ -536,6 +546,31 @@ class GuardSuite:
             if isinstance(value, str):
                 yield value
 
+    @staticmethod
+    def screen_visibility(
+        evidence: Sequence[Evidence], *, visibility: VisibilityScope
+    ) -> tuple[EvidenceId, ...]:
+        """Evidence this actor may not read, inside the tenant they belong to.
+
+        **Runs on the evidence the caller SUPPLIED, not only on what the engine retrieved.**
+        That distinction is the whole reason this exists: `RetrievalEngine` filters what it
+        fetches itself, and a host that gathers its own candidates - which is the common
+        case, because most hosts already have a retrieval stack - handed them straight past
+        the check. The scope was carried in the context and hashed into the attestation, and
+        nothing compared anything to it.
+
+        A record that asserts a boundary nothing applied is the defect this package names in
+        its own gateway docstring. It was reproduced here, one layer over.
+
+        Returns the offending ids rather than a bool, because a boundary finding that cannot
+        say WHICH document is an alert nobody can act on.
+        """
+        return tuple(
+            item.evidence_id
+            for item in evidence
+            if not visibility.permits(corpus=item.source.corpus, source_id=item.source.source_id)
+        )
+
     def evaluate(self, outcome: GuardOutcome) -> WarrantReport:
         """Produce the boundary warrant.
 
@@ -566,6 +601,21 @@ class GuardSuite:
                         severity=Severity.ERROR,
                     )
                 )
+        if outcome.visibility:
+            # Unconditional, like tenancy. A conflicted reader seeing a matter they are
+            # walled off from is not a thing a profile gets to downgrade to a warning: in a
+            # law firm it is the event that disqualifies the firm from the engagement.
+            satisfied = False
+            findings.append(
+                Finding(
+                    code="visibility_barred",
+                    message=(
+                        f"{len(outcome.visibility)} evidence item(s) outside this actor's "
+                        f"visibility scope: {sorted(str(e) for e in outcome.visibility)}"
+                    ),
+                    severity=Severity.ERROR,
+                )
+            )
         if outcome.tenancy is not None and not outcome.tenancy.clean:
             satisfied = False
             findings.append(

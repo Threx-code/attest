@@ -168,6 +168,10 @@ NON_DOWNGRADEABLE: Final[frozenset[str]] = frozenset(
         # "Restoration is total. Unmatched tokens fail the run rather than shipping."
         "outbound_leakage",
         "incomplete_restoration",
+        # docs/kernel/tenancy.md - an ethical wall is not a preference. A conflicted
+        # reader seeing a matter they are screened off from is the event that disqualifies
+        # a firm from an engagement, and no profile gets to call it a warning.
+        "visibility_barred",
     }
 )
 """Finding codes whose failure no :class:`WarrantPolicy` can soften.

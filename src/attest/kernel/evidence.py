@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from datetime import date, datetime
 
-    from attest.kernel.identifiers import EvidenceId, TenantId
+    from attest.kernel.identifiers import CorpusId, EvidenceId, TenantId
 
 __all__ = [
     "CORE_EVIDENCE_KINDS",
@@ -232,6 +232,15 @@ class SourceRef:
 
     validity: ValidityWindow = field(default_factory=ValidityWindow)
     tenant: TenantId | None = None
+
+    corpus: CorpusId | None = None
+    """Which body of material this came from, for within-tenant read scoping.
+
+    ``None`` means the source declared none, and under a `VisibilityScope` allowlist that
+    is refused rather than admitted - an allowlist that admits what it cannot check has
+    stopped being one. Optional because most deployments have no walls and every existing
+    source predates the field.
+    """
 
     def __post_init__(self) -> None:
         if not self.source_id:

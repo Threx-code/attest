@@ -150,3 +150,73 @@ def test_a_chain_without_both_halves_is_refused(kind: str, identifier: object) -
 
     with pytest.raises(ValueError, match="entity chain needs"):
         Chains.for_entity(kind, identifier)
+
+
+# ── The wall, enforced rather than recorded ──────────────────────────────────
+
+
+@pytest.mark.security
+def test_supplied_evidence_is_screened_against_the_wall() -> None:
+    """The gap this closes, and it is the one that matters.
+
+    `RetrievalEngine` filters what it fetches itself. A host with its own retrieval stack -
+    the common case, because most hosts already have one - handed its candidates straight
+    past that check. The scope was carried in the context and hashed into the attestation
+    while nothing compared anything to it: a record asserting a boundary that never applied,
+    which is the defect this package names in its own gateway docstring.
+    """
+    from datetime import UTC, datetime
+
+    from attest.capabilities.guards import GuardSuite, InjectionGuard, TenancyGuard
+    from attest.kernel.evidence import (
+        AuthorityLevel,
+        Evidence,
+        EvidenceKinds,
+        SourceRef,
+        SourceType,
+    )
+    from attest.kernel.identifiers import EvidenceId, Hash
+
+    def item(source_id: str) -> Evidence:
+        return Evidence(
+            evidence_id=EvidenceId(f"ev_{source_id}"),
+            kind=EvidenceKinds.QUOTED_SPAN,
+            source=SourceRef(
+                source_id=source_id,
+                source_type=SourceType.USER_SUPPLIED,
+                authority=AuthorityLevel.ADVISORY,
+                version="1",
+                retrieved_at=datetime(2026, 8, 2, tzinfo=UTC),
+                integrity_hash=Hash("a" * 64),
+            ),
+            value="text",
+        )
+
+    suite = GuardSuite(injection=InjectionGuard("acme"), tenancy=TenancyGuard())
+    scope = VisibilityScope(barred_sources=frozenset({"matter-9"}))
+
+    barred = suite.screen_visibility([item("matter-1"), item("matter-9")], visibility=scope)
+
+    assert [str(e) for e in barred] == ["ev_matter-9"]
+
+
+@pytest.mark.security
+def test_a_walled_read_fails_the_boundary_warrant() -> None:
+    """Unconditional, like tenancy. In a law firm a conflicted reader seeing a screened
+    matter is the event that disqualifies the firm from the engagement - not a warning."""
+    from attest.capabilities.guards import GuardOutcome, GuardSuite, InjectionGuard, TenancyGuard
+    from attest.kernel.identifiers import EvidenceId
+
+    suite = GuardSuite(injection=InjectionGuard("acme"), tenancy=TenancyGuard())
+
+    report = suite.evaluate(GuardOutcome(visibility=(EvidenceId("ev_9"),)))
+
+    assert not report.satisfied
+    assert [f.code for f in report.findings] == ["visibility_barred"]
+
+
+@pytest.mark.security
+def test_no_profile_can_downgrade_a_walled_read() -> None:
+    from attest.kernel.warrants import NON_DOWNGRADEABLE
+
+    assert "visibility_barred" in NON_DOWNGRADEABLE
