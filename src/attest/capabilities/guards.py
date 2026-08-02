@@ -71,6 +71,14 @@ _BASE_PATTERNS: tuple[str, ...] = (
     # the instructions, it appends to them. Cheap to match and impossible to write by
     # accident in prose.
     r"</?\s*(system|assistant|\|?im_start\|?|\|?im_end\|?)\s*>",
+    # A forged CONTAINER boundary. A host that fences untrusted content in a tagged
+    # envelope has made that tag part of its prompt structure, and content carrying a
+    # closing tag is trying to end the fence early and continue where the trusted
+    # instruction goes. The host should also make the tag unguessable; this is so the
+    # attempt is RECORDED rather than merely defeated - a nonce that silently works leaves
+    # no signal that anyone tried.
+    r"</\s*(DOCUMENT|CONTEXT|SOURCES?|INSTRUCTIONS?|TOOL_RESULTS?|"
+    r"[A-Z][A-Z_]{2,30})\s*>",
     # "act as an unrestricted AI", "act as if you were DAN". Deliberately NOT the bare
     # "act as a" that a first pass would write: "the trustee shall act as agent" and "the
     # bank may act as custodian" are ordinary sentences in the documents this framework is
