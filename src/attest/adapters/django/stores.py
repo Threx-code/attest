@@ -56,7 +56,7 @@ from attest.adapters.django.models import (
 from attest.capabilities.memory import MemoryGuard
 from attest.kernel.audit import EventType
 from attest.kernel.authority import ApprovalRecord
-from attest.kernel.canonical import Canonical
+from attest.kernel.canonical import NULL_HASH, Canonical
 from attest.kernel.codec import AttestationCodec, AuditEventCodec
 from attest.kernel.errors import (
     ApprovalStoreError,
@@ -216,6 +216,58 @@ class DjangoAuditSink:
                 f"could not append audit event for run {event.run_id!r}: {exc}. If we "
                 f"cannot record what happened, we must not act."
             ) from exc
+
+    def append_sealed(self, event: AuditEvent, *, attempts: int = 3) -> AuditEvent:
+        """Append ONE event with its position and link assigned, now.
+
+        The batch sealer assigns a dense 1..N once a run is over. An **entity** chain is
+        never over - a matter accumulates events for years - so "later" never comes, and a
+        chain of unsealed rows has ``sequence=NULL`` and ``previous_hash=""`` on every row.
+        That is not a chain: there is no link for a deletion to break and no dense sequence
+        for it to gap, so the artefact that exists to prove completeness proves nothing.
+
+        **The position is read from the tail, not counted.** ``COUNT(*)`` is O(rows for this
+        entity), so recording an act got slower as the entity accumulated history - exactly
+        backwards, and worst on the oldest and most consequential matters. The tail read is
+        one indexed row.
+
+        **A race fails loudly rather than duplicating.** Two concurrent acts read the same
+        tail and compute the same next position; the unique constraint on
+        ``(run_id, sequence)`` rejects the loser, which retries against the new tail. Without
+        it both rows persist at the same nominal position, which is a fork presented as a
+        chain - and the application would have chosen its own sequence from a racy read,
+        which is the precise thing the seal exists to prevent.
+        """
+        for attempt in range(1, attempts + 1):
+            tail = (
+                AuditEventRecord.objects.filter(run_id=str(event.run_id), sequence__isnull=False)
+                .order_by("-sequence")
+                .first()
+            )
+            previous = (
+                AuditEventCodec.decode(bytes(tail.payload)).event_hash()
+                if tail is not None
+                else Hash(NULL_HASH)
+            )
+            sealed = event.sealed_as((tail.sequence + 1) if tail is not None else 1, previous)
+            try:
+                with transaction.atomic():
+                    AuditEventRecord.objects.create(**self._row(sealed))
+            except IntegrityError:
+                if attempt == attempts:
+                    raise AuditSinkError(
+                        f"could not place event in chain {event.run_id!r} after {attempts} "
+                        f"attempts: another writer took every position we computed. The act "
+                        f"must not commit without its chain entry."
+                    ) from None
+                continue
+            except Exception as exc:
+                raise AuditSinkError(
+                    f"could not append sealed audit event for {event.run_id!r}: {exc}. If we "
+                    f"cannot record what happened, we must not act."
+                ) from exc
+            return sealed
+        raise AuditSinkError("unreachable: the retry loop always returns or raises")
 
     def append_many(self, events: Sequence[AuditEvent]) -> None:
         if not events:

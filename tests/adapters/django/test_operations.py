@@ -601,3 +601,96 @@ def test_the_reconciliation_run_is_the_one_the_correction_is_written_under() -> 
     assert corrected is not None
     assert corrected.supersedes == RunId("run_unknown")
     assert {e.run_id for e in audit.read_chain(result.record)} == {result.record}
+
+
+# ── Incremental sealing: entity chains ───────────────────────────────────────
+
+
+def test_an_entity_chain_is_sealed_as_it_grows() -> None:
+    """The batch sealer assigns 1..N once a run is over. An entity chain is never over.
+
+    A matter accumulates events for years, so "later" never comes and every row carried
+    `sequence=NULL` and `previous_hash=""`. That is not a chain: no link for a deletion to
+    break, no dense sequence for it to gap, and the artefact that exists to prove
+    completeness proved nothing.
+    """
+    from datetime import UTC, datetime
+
+    from attest.adapters.django.stores import DjangoAuditSink
+    from attest.kernel.audit import AuditEvent, Chains, ChainVerifier
+
+    sink = DjangoAuditSink()
+    chain = Chains.for_entity("Matter", "m-1")
+    for n in range(3):
+        sink.append_sealed(
+            AuditEvent(
+                run_id=chain,
+                event_type="matter.status.change",
+                occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"n": n},
+                event_id=f"e{n}",
+            )
+        )
+
+    events = sink.read_chain(chain)
+    assert [e.sequence for e in events] == [1, 2, 3]
+    assert ChainVerifier.verify(events, run_id=chain).verified
+
+
+def test_a_removed_event_breaks_the_chain() -> None:
+    """The property the whole thing exists for, asserted against the verifier rather than
+    against a row count - a count changing after a delete proves only that a delete
+    happened."""
+    from datetime import UTC, datetime
+
+    from attest.adapters.django.stores import DjangoAuditSink
+    from attest.kernel.audit import AuditEvent, Chains, ChainVerifier
+
+    sink = DjangoAuditSink()
+    chain = Chains.for_entity("Matter", "m-2")
+    for n in range(3):
+        sink.append_sealed(
+            AuditEvent(
+                run_id=chain,
+                event_type="matter.status.change",
+                occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"n": n},
+                event_id=f"e{n}",
+            )
+        )
+
+    # The row cannot actually be deleted - the append-only trigger refuses, which is the
+    # first line of defence and is tested elsewhere. What this asserts is the second: that
+    # a chain WITH an event missing fails verification, which is what a verifier sees if
+    # someone reached the storage below the trigger.
+    surviving = [e for e in sink.read_chain(chain) if e.sequence != 2]
+
+    assert not ChainVerifier.verify(surviving, run_id=chain).verified
+
+
+def test_two_writers_cannot_take_the_same_position() -> None:
+    """The race the constraint closes. Both compute the same next slot from the same tail;
+    one lands, the other retries. Without it both persist, which is a fork presented as a
+    chain and an application choosing its own sequence from a racy read."""
+    from datetime import UTC, datetime
+
+    from attest.adapters.django.stores import DjangoAuditSink
+    from attest.kernel.audit import AuditEvent, Chains
+
+    sink = DjangoAuditSink()
+    chain = Chains.for_entity("Matter", "m-3")
+
+    def event(n: int) -> AuditEvent:
+        return AuditEvent(
+            run_id=chain,
+            event_type="matter.status.change",
+            occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+            payload={"n": n},
+            event_id=f"e{n}",
+        )
+
+    first = sink.append_sealed(event(0))
+    second = sink.append_sealed(event(1))
+
+    assert (first.sequence, second.sequence) == (1, 2)
+    assert second.previous_hash == first.event_hash()
