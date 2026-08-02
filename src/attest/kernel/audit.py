@@ -37,13 +37,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from attest.kernel.canonical import NULL_HASH, Canonical
-from attest.kernel.identifiers import Hash
+from attest.kernel.identifiers import Hash, RunId
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from datetime import datetime
 
-    from attest.kernel.identifiers import RunId
     from attest.kernel.ports import Signer
 
 __all__ = [
@@ -51,9 +50,56 @@ __all__ = [
     "AuditEvent",
     "ChainVerification",
     "ChainVerifier",
+    "Chains",
     "EventType",
     "RunSeal",
 ]
+
+
+class Chains:
+    """What a chain is *about*. A run, or the history of one entity.
+
+    Every chain here is keyed by ``RunId`` because a run was the only unit this package
+    sealed. That is the right unit for a request and the wrong one for a record: a status
+    change on a matter is not a run, it is one event in a life that spans years and
+    hundreds of them, and chaining each act on its own produces sequences of length one -
+    which prove nothing, because there is no predecessor for a removed entry to break.
+
+    An adopter reaching for this invents a convention: a synthetic run id per entity. Two
+    adopters invent two, neither can read the other's, and `verify_audit_chain` cannot be
+    pointed at either without knowing the trick. So the convention ships here.
+
+    The prefix is what makes the two kinds distinguishable in storage. A verifier sweeping
+    every chain needs to know it is looking at an open-ended history rather than a run that
+    should have sealed - an unsealed run is a fault, an unsealed entity history is Tuesday.
+    """
+
+    ENTITY_PREFIX = "entity"
+
+    @classmethod
+    def for_entity(cls, kind: str, identifier: object) -> RunId:
+        """The chain covering one entity's whole history.
+
+        ``kind`` is the host's own word - "Matter", "Account", "Patient". This package does
+        not know what those are and does not need to; it needs the two chains to be
+        distinct and the id to be stable.
+        """
+        if not kind or identifier is None or str(identifier) == "":
+            raise ValueError(
+                "an entity chain needs a kind and an identifier. Without both, two "
+                "entities share a chain and a gap in one reads as a gap in the other."
+            )
+        return RunId(f"{cls.ENTITY_PREFIX}:{kind}:{identifier}")
+
+    @classmethod
+    def is_entity(cls, chain: RunId) -> bool:
+        """Whether this chain is an entity history rather than a run.
+
+        A run that never sealed is a fault worth investigating. An entity history that has
+        not sealed is simply still going, and a sweep that reported every one of them would
+        bury the fault it exists to surface.
+        """
+        return str(chain).startswith(f"{cls.ENTITY_PREFIX}:")
 
 
 class EventType(StrEnum):

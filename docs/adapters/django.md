@@ -109,6 +109,29 @@ An unknown key is **rejected, not ignored**: a misspelled setting that is silent
 leaves the deployment running the default it was configured to replace, and every
 attestation it produces records a value nobody chose.
 
+## Running your test suite
+
+`TransactionTestCase` truncates tables between tests, and truncation is `DELETE`. The
+append-only triggers refuse, so every such class fails at teardown the moment an attest row
+exists - which, once the engine is wired, is every test that executes a run. The failure
+surfaces as an `IntegrityError` in teardown with no obvious connection to what the test was
+doing, and the natural next move is to stop installing the app.
+
+```python
+# conftest.py
+from attest.adapters.django.testing import AppendOnlyTriggers
+
+@pytest.fixture(scope="session", autouse=True)
+def _attest_test_db(django_db_setup, django_db_blocker):
+    with django_db_blocker.unblock():
+        AppendOnlyTriggers.drop()
+```
+
+It refuses to run against a database whose name does not look like a test one. A helper that
+silently disabled an integrity control in production would be the most dangerous thing this
+package ships, and "it is only called from conftest" is exactly the assumption that stops
+being true.
+
 ## The append-only trigger
 
 Shipped as a migration, because application-level discipline is not enforcement.

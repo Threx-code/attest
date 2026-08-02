@@ -48,6 +48,7 @@ __all__ = [
     "ModelRef",
     "ProfileRef",
     "TenantBinding",
+    "VisibilityScope",
 ]
 
 
@@ -186,6 +187,64 @@ class TenantBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class VisibilityScope:
+    """What this actor may READ, inside the tenant they already belong to.
+
+    Tenancy answers "whose data is this". It does not answer "may *this person* see it",
+    and in every regulated profession that second question has its own answer: an ethical
+    wall between two teams in a law firm, a Chinese wall between advisory and trading, a
+    need-to-know boundary on a clinical record. A framework that models only the tenant
+    treats a firm as one undifferentiated reader, which no firm is.
+
+    Resolved at context capture and carried in the context, for the same reason residency
+    is: a scope passed per call is a scope a caller can forget, and the record would then
+    assert a boundary that never applied.
+
+    Both fields are empty by default, and they fail in opposite directions on purpose.
+    """
+
+    permitted_corpora: frozenset[CorpusId] = frozenset()
+    """Corpora this actor may read. **Empty means unrestricted.**
+
+    An allowlist, because an agent's scope is a small declared set. Empty is permissive
+    because the alternative - every deployment enumerating its whole corpus before anything
+    retrieves - is a rule nobody would adopt, and an unadopted control protects nothing.
+    """
+
+    barred_sources: frozenset[str] = frozenset()
+    """Sources this actor is screened FROM. **Empty means nothing is screened.**
+
+    A denylist, because a wall is an exception to general access: a conflicted matter, a
+    deal the reader is on the other side of. Enumerating everything they may see instead
+    would be the whole firm minus three files, recomputed on every change.
+
+    Checked after `permitted_corpora`, and a bar always wins - the same resolution
+    `Scope.permits_evidence` uses, and for the same reason: a domain that permits broadly
+    and screens one thing means the screen.
+    """
+
+    def permits(self, *, corpus: CorpusId | None, source_id: str) -> bool:
+        """Whether this actor may read that source."""
+        if source_id in self.barred_sources:
+            return False
+        if not self.permitted_corpora:
+            return True
+        return corpus is not None and corpus in self.permitted_corpora
+
+    def narrowed_to(self, corpora: frozenset[CorpusId]) -> VisibilityScope:
+        """This scope, narrowed by an agent's own. **Never widened.**
+
+        An agent declaring corpora it may read cannot thereby gain access the actor does
+        not have - the same rule `Scope.narrowed_to` applies to delegation, applied to the
+        reader rather than to the callee.
+        """
+        if not corpora:
+            return self
+        narrowed = corpora if not self.permitted_corpora else self.permitted_corpora & corpora
+        return VisibilityScope(permitted_corpora=narrowed, barred_sources=self.barred_sources)
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionContext:
     """One moment, captured. Everything downstream reads only from here."""
 
@@ -200,6 +259,13 @@ class ExecutionContext:
     prompt_hashes: Mapping[str, Hash] = field(default_factory=dict)
     tool_spec_hashes: Mapping[str, Hash] = field(default_factory=dict)
     corpus_epochs: Mapping[CorpusId, str] = field(default_factory=dict)
+
+    visibility: VisibilityScope = field(default_factory=VisibilityScope)
+    """What this actor may read inside the tenant. See :class:`VisibilityScope`.
+
+    Default is unrestricted, which keeps every existing deployment behaving exactly as it
+    did. A deployment that has an ethical wall resolves it here, once, at capture.
+    """
     model: ModelRef | None = None
     """``None`` for a run with no model call — a rules engine or a scheduled job
     proposing through the same kernel."""
@@ -246,6 +312,14 @@ class ExecutionContext:
                     "prompt_hashes": dict(self.prompt_hashes),
                     "tool_spec_hashes": dict(self.tool_spec_hashes),
                     "corpus_epochs": dict(self.corpus_epochs),
+                    # In the hash because it is a boundary the attestation asserts. A run
+                    # that read behind a wall and one that did not are different runs, and
+                    # a record that cannot tell them apart cannot answer the only question
+                    # a conflicts review asks.
+                    "visibility": {
+                        "permitted_corpora": sorted(self.visibility.permitted_corpora),
+                        "barred_sources": sorted(self.visibility.barred_sources),
+                    },
                     "model": None
                     if self.model is None
                     else {

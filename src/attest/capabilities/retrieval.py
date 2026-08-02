@@ -98,6 +98,10 @@ class RetrievalEngine:
         admitted: list[Evidence] = []
         rejected: list[RejectedEvidence] = []
         for item in candidates:
+            barred = self._barred(item, context=context)
+            if barred is not None:
+                rejected.append(barred)
+                continue
             verdict = self._verify(item, at=context.captured_at.date())
             if verdict is None or verdict.outcome is VerificationOutcome.PASS:
                 admitted.append(item)
@@ -111,6 +115,36 @@ class RetrievalEngine:
                 )
             )
         return RetrievalOutcome(tuple(admitted), tuple(rejected), query=query)
+
+    @staticmethod
+    def _barred(item: Evidence, *, context: ExecutionContext) -> RejectedEvidence | None:
+        """Whether this actor may read this source at all, tenancy aside.
+
+        Tenancy answers "whose data is this"; it does not answer "may *this person* see
+        it", and in a law firm those are different questions with different answers. An
+        ethical wall between two teams, a Chinese wall between advisory and trading, a
+        need-to-know boundary on a clinical record - a framework that models only the
+        tenant treats a firm as one undifferentiated reader, which no firm is.
+
+        **Rejected rather than raised**, and the asymmetry with `RetrieverScopeError` above
+        is deliberate. A cross-TENANT result means the index was searched across tenants
+        and the scoping already failed, so continuing is not safe. A screened source is the
+        ordinary case: the retriever was scoped correctly and this reader is walled off
+        from one matter among many. The run proceeds without it, and the rejection is
+        recorded - which is what a conflicts review needs to see.
+        """
+        corpus = item.source.corpus if hasattr(item.source, "corpus") else None
+        if context.visibility.permits(corpus=corpus, source_id=item.source.source_id):
+            return None
+        return RejectedEvidence(
+            evidence_id=str(item.evidence_id),
+            source_id=item.source.source_id,
+            outcome=VerificationOutcome.UNVERIFIABLE,
+            detail=(
+                "outside this actor's visibility scope: screened source or a corpus they "
+                "may not read. Not a verification failure - the source was never opened."
+            ),
+        )
 
     def _verify(self, item: Evidence, *, at: date) -> SupportResult | None:
         """Verification result, or ``None`` when no engine was supplied.

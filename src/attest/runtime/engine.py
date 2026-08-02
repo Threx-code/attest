@@ -66,7 +66,7 @@ from attest.kernel.attestation import Attestation, CostRecord, EffectRecord
 from attest.kernel.audit import EventType
 from attest.kernel.authority import MAX_GRANT_TTL, AuthorizationGrant, Discharge
 from attest.kernel.canonical import Canonical
-from attest.kernel.context import ExecutionContext, IdentitySnapshot
+from attest.kernel.context import ExecutionContext, IdentitySnapshot, VisibilityScope
 from attest.kernel.effects import WORLD_REACHING_EFFECT_STATES, EffectState
 from attest.kernel.errors import ConfigurationError
 from attest.kernel.identifiers import GrantId, Nonces, RunId, RunIds
@@ -193,6 +193,18 @@ class RunRequest:
     prompt_hashes: Mapping[str, str] = field(default_factory=dict)
     idempotency_key: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    visibility: VisibilityScope = field(default_factory=VisibilityScope)
+    """What this actor may READ inside the tenant - the ethical wall, resolved by the host.
+
+    Tenancy says whose data it is. This says whether *this person* may see it, which in a
+    law firm, a bank or a hospital is a different question with a different answer. Default
+    is unrestricted, so a deployment without walls behaves exactly as before.
+
+    Resolved by the host at dispatch and passed here, like `capabilities`: the framework
+    cannot know who is conflicted out of which matter, and a scope computed later than
+    dispatch is one the record cannot vouch for.
+    """
 
     agent: AgentSpec | None = None
     """The agent this run is proposing as, where one exists.
@@ -1075,6 +1087,15 @@ class RunEngine:
             evidence=request.evidence,
             prompt_hashes=dict(request.prompt_hashes),  # type: ignore[arg-type]
             model=(request.model_calls.model_ref() if request.model_calls else request.model),
+            # The actor's read scope, narrowed by the agent's own declared corpora and
+            # never widened by them. An agent naming corpora it may read cannot thereby
+            # reach past a wall the reader is behind - the rule `Scope.narrowed_to` applies
+            # to delegation, applied here to the reader.
+            visibility=(
+                request.visibility
+                if request.agent is None
+                else request.visibility.narrowed_to(request.agent.scope.corpora)
+            ),
         )
 
     def _assess(

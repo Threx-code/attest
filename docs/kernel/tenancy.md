@@ -168,3 +168,36 @@ leak wearing a performance optimisation.
 - [`config.md`](config.md) — `for_tenant()`
 - [`execution-context.md`](execution-context.md) — where the binding is captured
 - [`../capabilities/guards.md`](../capabilities/guards.md) — the tenancy guard
+
+
+## Inside the tenant: visibility
+
+Tenancy answers *whose data is this*. It does not answer *may this person see it*, and in
+every regulated profession that second question has its own answer - an ethical wall between
+two teams in a law firm, a Chinese wall between advisory and trading, need-to-know on a
+clinical record. A framework that models only the tenant treats a firm as one
+undifferentiated reader, which no firm is.
+
+`ExecutionContext.visibility` carries it, resolved by the host at dispatch and hashed into
+the context like residency. Two fields, failing in opposite directions on purpose:
+
+* `permitted_corpora` is an **allowlist**, empty meaning unrestricted. An agent's scope is a
+  small declared set; requiring every deployment to enumerate its whole corpus before
+  anything retrieves is a rule nobody adopts, and an unadopted control protects nothing.
+* `barred_sources` is a **denylist**, empty meaning nothing is screened. A wall is an
+  exception to general access - a conflicted matter, a deal the reader is on the other side
+  of. Enumerating what they may see instead is the whole firm minus three files, recomputed
+  on every change.
+
+A bar always wins over a permitted corpus, the same resolution `Scope.permits_evidence` uses
+and for the same reason.
+
+`RetrievalEngine` **rejects** rather than raises on a screened source, and the asymmetry with
+the cross-tenant check is deliberate. A cross-tenant result means the index was searched
+across tenants and the scoping already failed, so continuing is not safe. A screened source
+is the ordinary case: the retriever was scoped correctly and this reader is walled off from
+one matter among many. The run proceeds without it and the rejection is recorded, which is
+what a conflicts review needs to see.
+
+An agent's declared corpora **narrow** this and never widen it. An agent naming a corpus it
+may read cannot thereby reach past a wall the reader is behind.
