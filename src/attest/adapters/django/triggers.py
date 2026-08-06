@@ -79,6 +79,35 @@ class _GuardOperation(Operation):
             )
         return vendor
 
+    def _router_blocks(self, app_label: str, schema_editor: Any) -> bool:
+        """Whether the database router says this operation does not belong in this schema.
+
+        Django's own ``RunSQL`` and ``RunPython`` consult the router before touching anything;
+        a custom :class:`Operation` that does not is simply invisible to routing, and executes
+        everywhere. That is fine until a router has something to say.
+
+        Under ``django-tenants`` it does. Apps are partitioned into a shared ``public`` schema
+        and a schema per tenant, and the router answers ``allow_migrate`` per app. A guard
+        operation belonging to a TENANT app therefore must not run while the shared schema is
+        being migrated - the table it guards is not there, and never will be:
+
+        .. code-block:: text
+
+            django.db.utils.ProgrammingError: relation "attest_audit_events" does not exist
+
+        which is a hard failure of ``migrate_schemas --shared``, so the whole deployment cannot
+        be built. Skipping is right rather than merely convenient: the operation runs again for
+        each tenant schema, where the table exists, so the guarantee is installed exactly where
+        the data lives and nowhere it does not.
+
+        A deployment with no router at all is unaffected - ``allow_migrate`` returns ``True``.
+        """
+        from django.db import router
+
+        return not router.allow_migrate(
+            schema_editor.connection.alias, app_label, **getattr(self, "hints", {})
+        )
+
     def _execute(self, schema_editor: Any, statements: Sequence[str]) -> None:
         for statement in statements:
             schema_editor.execute(statement)
@@ -110,11 +139,15 @@ class AppendOnlyTable(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._execute(schema_editor, self._install(self._vendor(schema_editor)))
 
     def database_backwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._execute(schema_editor, self._remove(self._vendor(schema_editor)))
 
     def _names(self) -> tuple[str, str]:
@@ -182,11 +215,15 @@ class ImmutableColumns(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._execute(schema_editor, self._install(self._vendor(schema_editor)))
 
     def database_backwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         vendor = self._vendor(schema_editor)
         name = self._name()
         if vendor == "postgresql":
@@ -279,6 +316,8 @@ class RangePartitionByMonth(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._vendor(schema_editor)
         self._assert_empty(schema_editor)
         self._execute(schema_editor, self._install())
@@ -286,6 +325,8 @@ class RangePartitionByMonth(_GuardOperation):
     def database_backwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         raise NotImplementedError(
             f"un-partitioning {self.table} would have to merge every child back into "
             f"one table, which is a data migration rather than a schema change. Roll "
@@ -351,6 +392,8 @@ class EnsurePartitions(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._vendor(schema_editor)
         self._execute(schema_editor, self.statements(self.table, self.months, self.start))
 
@@ -438,6 +481,8 @@ class TrigramIndex(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._vendor(schema_editor)
         self._execute(
             schema_editor,
@@ -451,6 +496,8 @@ class TrigramIndex(_GuardOperation):
     def database_backwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._vendor(schema_editor)
         self._execute(schema_editor, [f"DROP INDEX IF EXISTS {self._index_name()}"])
 
@@ -485,11 +532,15 @@ class NoEventsAfterSeal(_GuardOperation):
     def database_forwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._execute(schema_editor, self._install(self._vendor(schema_editor)))
 
     def database_backwards(
         self, app_label: str, schema_editor: Any, from_state: Any, to_state: Any
     ) -> None:
+        if self._router_blocks(app_label, schema_editor):
+            return
         self._execute(schema_editor, self._remove(self._vendor(schema_editor)))
 
     def _name(self) -> str:
