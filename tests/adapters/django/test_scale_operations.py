@@ -27,7 +27,10 @@ class Editor:
 
     def __init__(self, vendor: str = "postgresql", *, rows: bool = False) -> None:
         self.executed: list[str] = []
-        self.connection = type("C", (), {"vendor": vendor, "cursor": lambda _: Cursor(rows)})()
+        # `alias` for the same reason as elsewhere: the router is keyed by it.
+        self.connection = type(
+            "C", (), {"vendor": vendor, "alias": "default", "cursor": lambda _: Cursor(rows)}
+        )()
 
     def execute(self, statement: str) -> None:
         self.executed.append(statement)

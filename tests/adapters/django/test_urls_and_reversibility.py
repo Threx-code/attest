@@ -36,7 +36,10 @@ class _Recorder:
     """Captures the SQL a migration operation would run."""
 
     def __init__(self, vendor: str) -> None:
-        self.connection = type("Connection", (), {"vendor": vendor})()
+        # `alias` because every real Django connection has one: `_router_blocks` asks the
+        # database router which schema this operation belongs in, and the router is keyed by
+        # alias. A double that omits it is a double that cannot meet the code it stands in for.
+        self.connection = type("Connection", (), {"vendor": vendor, "alias": "default"})()
         self.statements: list[str] = []
 
     def execute(self, statement: str) -> None:

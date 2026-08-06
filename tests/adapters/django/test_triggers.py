@@ -96,12 +96,92 @@ def test_a_redeemed_nonce_cannot_be_deleted_to_permit_a_replay(now: datetime) ->
         RedeemedNonce.objects.filter(pk="n1").delete()
 
 
+class _RecordingEditor:
+    """A schema editor that captures SQL instead of running it."""
+
+    def __init__(self, vendor: str = "postgresql", alias: str = "default") -> None:
+        self.connection = type("Connection", (), {"vendor": vendor, "alias": alias})()
+        self.statements: list[str] = []
+
+    def execute(self, statement: str) -> None:
+        self.statements.append(statement)
+
+
+def test_the_router_decides_which_schema_a_guard_belongs_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guard operation is skipped where the router says its app does not live.
+
+    Django's own ``RunSQL`` and ``RunPython`` consult the router before touching anything.
+    A custom :class:`Operation` that does not is invisible to routing and runs everywhere -
+    which is fine until a router has something to say.
+
+    Under ``django-tenants`` it does: apps are split between a shared ``public`` schema and one
+    per tenant, and a guard belonging to a tenant app must not be installed while ``public`` is
+    being migrated, because the table it guards is not there.
+
+    .. code-block:: text
+
+        django.db.utils.ProgrammingError: relation "attest_audit_events" does not exist
+
+    That failed ``migrate_schemas --shared``, which is the first command a cloud deployment
+    runs, so the whole install could not be built.
+    """
+    from django.db import router
+
+    from attest.adapters.django.triggers import AppendOnlyTable
+
+    monkeypatch.setattr(router, "allow_migrate", lambda *a, **k: False)
+    editor = _RecordingEditor()
+
+    AppendOnlyTable("attest_audit_events").database_forwards("attest", editor, None, None)
+    AppendOnlyTable("attest_audit_events").database_backwards("attest", editor, None, None)
+
+    assert editor.statements == []
+
+
+def test_a_permissive_router_still_installs_the_guard() -> None:
+    """The other half. A test that only asserts refusal passes when everything is refused."""
+    from attest.adapters.django.triggers import AppendOnlyTable
+
+    editor = _RecordingEditor()
+
+    AppendOnlyTable("attest_audit_events").database_forwards("attest", editor, None, None)
+
+    assert editor.statements
+    assert any("CREATE" in statement.upper() for statement in editor.statements)
+
+
+def test_a_refused_vendor_is_not_reached_when_the_router_skips_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order matters: routing is asked FIRST.
+
+    ``_vendor`` raises for a database attest ships no trigger for, deliberately - a migration
+    that quietly did nothing would leave a deployment believing it had enforcement it does not.
+    But that refusal is about a schema this operation is actually meant to be in. Asking the
+    vendor before the router would turn "this app does not live here" into a hard failure on
+    an unsupported backend the operation was never going to touch.
+    """
+    from django.db import router
+
+    from attest.adapters.django.triggers import AppendOnlyTable
+
+    monkeypatch.setattr(router, "allow_migrate", lambda *a, **k: False)
+    editor = _RecordingEditor(vendor="oracle")
+
+    AppendOnlyTable("attest_audit_events").database_forwards("attest", editor, None, None)
+
+    assert editor.statements == []
+
+
 def test_an_unsupported_vendor_raises_rather_than_silently_skipping() -> None:
     """A migration that quietly did nothing would leave a false sense of enforcement."""
     from attest.adapters.django.triggers import AppendOnlyTable
 
     class _Connection:
         vendor = "oracle"
+        alias = "default"
 
     class _Editor:
         connection = _Connection()
